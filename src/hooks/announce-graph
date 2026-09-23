@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# SessionStart: if this project has a graph, say so on turn zero.
+#
+# Exists because the blocking hooks only catch the rare case (a whole file above
+# the threshold). The common case — grepping five files for where something
+# lives — fires no hook at all, and the decision to query the graph fell back on
+# the user. Announcing it on entry means it never reaches them.
+#
+# Silence is the normal case: no graph or no binary costs zero tokens.
+
+[ "${SHUNT_DISABLE:-0}" = "1" ] && exit 0
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/graphify.sh"
+
+input=$(cat)
+cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
+[ -z "$cwd" ] && cwd="$PWD"
+
+command -v graphify >/dev/null 2>&1 || exit 0
+
+emit() { jq -n --arg t "$1" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$t}}'; }
+
+# 1. This project's graph (climbing from cwd).
+if graph=$(graphify_graph_path "$cwd"); then
+  emit "[graphify] This project has a graph at ${graph}
+For a structural question (who calls X, what Y exposes, how A connects to B),
+query it before reading or grepping — it comes from the AST, deterministic, free per query:
+  graphify query \"<question>\" --graph ${graph}
+  graphify explain \"<symbol>\" --graph ${graph}
+Read files afterwards, already knowing the slice."
+  exit 0
+fi
+
+# 2. Folder of repos: several graphs one level down.
+below=$(graphify_graphs_below "$cwd")
+[ -z "$below" ] && exit 0
+
+n=$(printf '%s\n' "$below" | wc -l | tr -d ' ')
+if [ "$n" -eq 1 ]; then
+  emit "[graphify] There is a graph below this directory: ${below}
+For a structural question, query it before reading or grepping:
+  graphify query \"<question>\" --graph ${below}"
+  exit 0
+fi
+
+# A comparison folder (few repos) and a work root (dozens) want different
+# things. Merging 3 implementations of the same thing is the point; merging 16
+# unrelated projects means nothing — and listing them all is noise.
+MAX_MERGE=5
+merged="${cwd%/}/${GRAPHIFY_OUT:-graphify-out}/graph.json"
+
+if [ "$n" -le "$MAX_MERGE" ]; then
+  # merge-graphs prefixes nodes with <repo>::, tags each with a repo attribute
+  # and puts communities in a shared id space — one question crosses the
+  # projects, which is the point of a comparison.
+  emit "[graphify] This directory holds ${n} indexed projects:
+$(printf '%s\n' "$below" | sed 's/^/  /')
+
+For a structural question inside one of them, use its --graph.
+To COMPARE the ${n} in a single query, merge first (nodes get prefixed by
+repo, so one question can cross the projects):
+  graphify merge-graphs $(printf '%s ' $below)--out ${merged}
+  graphify query \"<question>\" --graph ${merged}
+Read files afterwards, already knowing where to look."
+else
+  emit "[graphify] This directory is the root of ${n} indexed projects. The first ones:
+$(printf '%s\n' "$below" | head -5 | sed 's/^/  /')
+  (+$((n - 5)) more)
+
+For a structural question, use the --graph of the project in question:
+  graphify query \"<question>\" --graph <project>/graphify-out/graph.json
+Read files afterwards, already knowing the slice.
+(merge-graphs only makes sense across comparable projects, not here.)"
+fi

@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""PreToolUse on Bash: deny commands that would dump big files into the context.
+
+The first port matched `^(cat|head|tail|less|more) ` against the raw command
+string. In a week of real sessions that let through 586 commands that read
+files in the middle of a command line: `cd dir && cat x`, `cat x 2>/dev/null`
+(any `>` counted as "redirected"), `for f in *; do cat "$f"; done`, `sed -n
+1,5000p x`. Claude writes compound commands far more often than bare ones, so
+the hook caught almost nothing.
+
+This version parses the command with shfmt (mvdan/sh, a real bash parser) and
+walks the syntax tree, estimating how many lines the WHOLE command puts on
+stdout — which is what lands in Claude's context:
+
+  - `cd` is followed across `&&` and `;`, so relative paths resolve correctly;
+  - `for VAR in ...` loops are expanded (globs included, capped) and their
+    bodies evaluated per value;
+  - pipelines carry a line count from stage to stage: `head -n N` caps it,
+    grep/wc/awk/jq reduce it to "small", cat/sort/cut pass it through;
+  - only a redirect of stdout (`>`, `>>`, `&>`) to a file removes output;
+    `2>/dev/null` does not;
+  - `echo "$(cat x)"` prints, `x=$(cat x)` does not;
+  - the total is a SUM over the command: ten 100-line files are 1000 lines.
+
+Anything it cannot resolve (unbound variables, command substitutions as
+arguments, unknown commands) counts as zero. The failure mode is letting a
+dump through, never blocking a command that is not one: a false block costs a
+turn and teaches Claude to distrust the hook. Any internal error also allows.
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+MIN_LINES_DEFAULT = 350
+LOOP_CAP = 256
+HUGE_FILE_BYTES = 64 * 1024 * 1024
+
+# Commands whose output is (a bounded function of) their input files or stdin.
+READERS = {"cat", "tac", "nl", "bat", "batcat", "less", "more"}
+# Commands that pass every input line through to stdout.
+PASSTHROUGH = {"sort", "uniq", "cut", "tr", "column", "fold", "rev", "paste",
+               "expand", "unexpand", "fmt", "tee", "cat", "tac", "nl"}
+# Prefix commands that run the next word as the real command.
+WRAPPERS = {"sudo", "doas", "env", "time", "nice", "ionice", "command",
+            "builtin", "exec", "stdbuf", "nohup"}
+# Wrapper options that consume the following word.
+WRAPPER_OPTS_WITH_VALUE = {
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "-C", "-S"},
+    "nice": {"-n"},
+    "ionice": {"-c", "-n", "-p"},
+    "stdbuf": {"-i", "-o", "-e"},
+}
+TRIAGE = re.compile(
+    r"\b(cat|tac|nl|bat|batcat|less|more|head|tail|sed|jq|sort|uniq|cut|column|fold|rev|paste)\b"
+)
+SED_PRINT = re.compile(r"^\s*(\d+|\$)?\s*(?:,\s*(\d+|\$|\+\d+))?\s*p\s*$")
+SED_QUIT = re.compile(r"^\s*(\d+)\s*q\s*$")
+
+
+def allow():
+    sys.exit(0)
+
+
+class Ctx:
+    def __init__(self, cwd, env):
+        self.cwd = cwd
+        self.env = env
+        self.reads = []  # (path, lines) of files that fed the output
+
+    def fork(self):
+        c = Ctx(self.cwd, dict(self.env))
+        c.reads = self.reads  # shared: every read is a candidate for the message
+        return c
+
+
+_line_cache = {}
+
+
+def count_lines(path):
+    if path in _line_cache:
+        return _line_cache[path]
+    n = 0
+    try:
+        if path.startswith(("/proc/", "/sys/", "/dev/")) or not os.path.isfile(path):
+            n = 0
+        else:
+            size = os.path.getsize(path)
+            if size > HUGE_FILE_BYTES:
+                n = size // 60  # estimate; counting a huge file is not worth the latency
+            else:
+                with open(path, "rb") as f:
+                    while chunk := f.read(1 << 20):
+                        n += chunk.count(b"\n")
+    except OSError:
+        n = 0
+    _line_cache[path] = n
+    return n
+
+
+def resolve(ctx, p):
+    return os.path.normpath(p if os.path.isabs(p) else os.path.join(ctx.cwd, p))
+
+
+# --- words ----------------------------------------------------------------------
+
+def param_value(part, ctx):
+    """Value of a simple $NAME / ${NAME}; None for anything fancier or unbound."""
+    if any(k in part for k in ("Exp", "Slice", "Repl", "Index", "Length", "Excl", "Names")):
+        return None
+    name = (part.get("Param") or {}).get("Value")
+    if name in ctx.env:
+        return ctx.env[name]
+    if name == "HOME":
+        return os.environ.get("HOME")
+    if name == "PWD":
+        return ctx.cwd
+    return None
+
+
+def word_values(word, ctx):
+    """Expand a Word to the list of strings the shell would pass, or None."""
+    if word is None:
+        return None
+    literal, pattern, globbable = "", "", False
+    parts = word.get("Parts") or []
+    for i, p in enumerate(parts):
+        t = p.get("Type")
+        if t == "Lit":
+            s = p.get("Value", "")
+            if i == 0 and (s == "~" or s.startswith("~/")):
+                s = os.environ.get("HOME", "~") + s[1:]
+            literal += s
+            pattern += s
+            if any(c in s for c in "*?["):
+                globbable = True
+        elif t == "SglQuoted":
+            s = p.get("Value", "")
+            literal += s
+            pattern += glob.escape(s)
+        elif t == "DblQuoted":
+            for q in p.get("Parts") or []:
+                qt = q.get("Type")
+                if qt == "Lit":
+                    s = q.get("Value", "")
+                elif qt == "ParamExp":
+                    s = param_value(q, ctx)
+                    if s is None:
+                        return None
+                else:
+                    return None
+                literal += s
+                pattern += glob.escape(s)
+        elif t == "ParamExp":
+            s = param_value(p, ctx)
+            if s is None:
+                return None
+            literal += s
+            pattern += glob.escape(s)
+        else:
+            return None
+    if globbable:
+        base = pattern if os.path.isabs(pattern) else os.path.join(ctx.cwd, pattern)
+        matches = sorted(glob.glob(base))
+        if matches:
+            return matches
+    return [literal]
+
+
+def cmdsubst_lines(word, ctx):
+    """Lines printed by $(...) inside a word, for commands that echo their args."""
+    total = 0
+    for p in (word or {}).get("Parts") or []:
+        if p.get("Type") == "CmdSubst":
+            total += eval_stmts(p.get("Stmts") or [], ctx.fork(), 0)
+        elif p.get("Type") == "DblQuoted":
+            total += cmdsubst_lines(p, ctx)
+    return total
+
+
+# --- commands -------------------------------------------------------------------
+
+def split_args(argv):
+    """(flags, operands) — a lone '-' is an operand (stdin), '--' ends flags."""
+    flags, operands, done = [], [], False
+    for a in argv:
+        if a is None:
+            continue
+        if not done and a == "--":
+            done = True
+        elif not done and a.startswith("-") and a != "-":
+            flags.append(a)
+        else:
+            operands.append(a)
+    return flags, operands
+
+
+def file_inputs(ctx, operands, stdin, record=True):
+    """Total input lines for a filter reading files (or stdin when none)."""
+    if not operands or "-" in operands:
+        total = stdin
+    else:
+        total = 0
+    for op in operands:
+        if op == "-":
+            continue
+        path = resolve(ctx, op)
+        n = count_lines(path)
+        if n and record:
+            ctx.reads.append((path, n))
+        total += n
+    return total
+
+
+def head_tail(name, argv, ctx, stdin):
+    n, from_start, byte_mode = 10, False, False
+    operands, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        val = None
+        if a is None:
+            pass
+        elif a in ("-n", "--lines", "-c", "--bytes"):
+            byte_mode = a in ("-c", "--bytes")
+            val = argv[i + 1] if i + 1 < len(argv) else None
+            i += 1
+        elif a.startswith("--lines="):
+            val = a.split("=", 1)[1]
+        elif a.startswith("--bytes="):
+            byte_mode, val = True, a.split("=", 1)[1]
+        elif re.fullmatch(r"-n[+]?\d+", a):
+            val = a[2:]
+        elif re.fullmatch(r"-c[+]?\d+", a):
+            byte_mode, val = True, a[2:]
+        elif re.fullmatch(r"-\d+", a):
+            val = a[1:]
+        elif a.startswith("-") and a != "-":
+            pass  # -f, -q, -v, ...
+        else:
+            operands.append(a)
+        if val is not None and re.fullmatch(r"[+-]?\d+", val):
+            from_start = val.startswith("+")
+            n = int(val.lstrip("+-"))
+        i += 1
+    if byte_mode:
+        n = n // 40 + 1
+
+    def cap(lines):
+        if name == "tail" and from_start:
+            return max(lines - n + 1, 0)
+        return min(n, lines)
+
+    if not operands:
+        return cap(stdin)
+    total = 0
+    for op in operands:
+        path = resolve(ctx, op)
+        got = cap(count_lines(path))
+        if got:
+            ctx.reads.append((path, got))
+        total += got
+    return total
+
+
+def sed(argv, ctx, stdin):
+    quiet, scripts, script_file, operands, i = False, [], False, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a is None:
+            pass
+        elif a in ("-n", "--quiet", "--silent"):
+            quiet = True
+        elif a == "-i" or a.startswith("-i") or a.startswith("--in-place"):
+            return 0  # edits in place, prints nothing
+        elif a in ("-e", "--expression"):
+            if i + 1 < len(argv) and argv[i + 1] is not None:
+                scripts.append(argv[i + 1])
+            i += 1
+        elif a.startswith("--expression="):
+            scripts.append(a.split("=", 1)[1])
+        elif a in ("-f", "--file"):
+            script_file = True
+            i += 1
+        elif re.fullmatch(r"-[nEersuz]+", a):
+            quiet = quiet or "n" in a
+        elif a.startswith("-") and a != "-":
+            pass
+        else:
+            operands.append(a)
+        i += 1
+    if not scripts and not script_file and operands:
+        scripts.append(operands.pop(0))
+
+    files = operands
+    per_file = [count_lines(resolve(ctx, f)) for f in files] if files else [stdin]
+
+    def output_for(lines):
+        if script_file:
+            return 0 if quiet else lines
+        commands = [c for s in scripts for c in re.split(r"[;\n]", s) if c.strip()]
+        if quiet:
+            total = 0
+            for c in commands:
+                m = SED_PRINT.match(c)
+                if not m:
+                    continue
+                start, end = m.group(1), m.group(2)
+                a = lines if start == "$" else int(start) if start else 1
+                if end is None:
+                    b = a if start else lines
+                elif end == "$":
+                    b = lines
+                elif end.startswith("+"):
+                    b = a + int(end[1:])
+                else:
+                    b = int(end)
+                total += max(min(b, lines) - a + 1, 0)
+            return total
+        for c in commands:
+            m = SED_QUIT.match(c)
+            if m:
+                return min(int(m.group(1)), lines)
+        return lines
+
+    total = 0
+    for f, lines in zip(files or [None], per_file):
+        got = output_for(lines)
+        if f is not None and got:
+            ctx.reads.append((resolve(ctx, f), got))
+        total += got
+    return total
+
+
+def jq(argv, ctx, stdin):
+    flags_with_values = {"--arg": 2, "--argjson": 2, "--slurpfile": 2, "--rawfile": 2,
+                         "-f": 1, "--from-file": 1, "--indent": 1, "-L": 1}
+    operands, i, from_file = [], 0, False
+    while i < len(argv):
+        a = argv[i]
+        if a in flags_with_values:
+            from_file = from_file or a in ("-f", "--from-file")
+            i += flags_with_values[a]
+        elif a in ("--args", "--jsonargs"):
+            break
+        elif a is not None and not (a.startswith("-") and a != "-"):
+            operands.append(a)
+        i += 1
+    if from_file or not operands:
+        return 0
+    flt, files = operands[0], operands[1:]
+    if flt.strip() != ".":
+        return 0  # a real filter selects; treat like grep
+    if not files:
+        return stdin
+    total = 0
+    for f in files:
+        path = resolve(ctx, f)
+        lines = count_lines(path)
+        try:
+            # Pretty-printing minified JSON explodes the line count.
+            lines = max(lines, os.path.getsize(path) // 40)
+        except OSError:
+            pass
+        if lines:
+            ctx.reads.append((path, lines))
+        total += lines
+    return total
+
+
+def strip_wrappers(argv):
+    while argv and argv[0] in WRAPPERS:
+        w, argv = argv[0], argv[1:]
+        opts = WRAPPER_OPTS_WITH_VALUE.get(w, set())
+        while argv:
+            a = argv[0]
+            if a is None:
+                return []
+            if a in opts:
+                argv = argv[2:]
+            elif a.startswith("-"):
+                argv = argv[1:]
+            elif w == "env" and "=" in a:
+                argv = argv[1:]
+            else:
+                break
+    return argv
+
+
+def eval_call(cmd, ctx, stdin):
+    words = cmd.get("Args") or []
+    if not words:
+        return 0
+    argv = []
+    for w in words:
+        vals = word_values(w, ctx)
+        argv.extend(vals if vals is not None else [None])
+    argv = strip_wrappers(argv)
+    if not argv or argv[0] is None:
+        return 0
+    name, rest = os.path.basename(argv[0]), argv[1:]
+
+    if name == "cd":
+        target = rest[0] if rest else os.environ.get("HOME")
+        if target and target != "-":
+            ctx.cwd = resolve(ctx, target)
+        return 0
+    if name in ("echo", "printf"):
+        return sum(cmdsubst_lines(w, ctx) for w in words[1:])
+    if name in ("head", "tail"):
+        return head_tail(name, rest, ctx, stdin)
+    if name == "sed":
+        return sed(rest, ctx, stdin)
+    if name == "jq":
+        return jq(rest, ctx, stdin)
+    if name == "tee":
+        return stdin
+    if name in READERS or name in PASSTHROUGH:
+        if name in ("tr",):
+            return stdin
+        _, operands = split_args(rest)
+        # A passthrough filter's operands may be option values (`cut -d , -f 1`);
+        # count_lines() gives 0 to anything that is not an existing file.
+        return file_inputs(ctx, operands, stdin)
+    return 0  # unknown command: assume it does not dump
+
+
+def eval_stmts(stmts, ctx, stdin):
+    total = 0
+    for s in stmts:
+        total += eval_stmt(s, ctx, stdin)
+        stdin = 0
+    return total
+
+
+def eval_stmt(stmt, ctx, stdin):
+    if not stmt:
+        return 0
+    redirs = stmt.get("Redirs") or []
+    for r in redirs:
+        op = r.get("Op")
+        if op == "<":
+            vals = word_values(r.get("Word"), ctx)
+            if vals and len(vals) == 1:
+                path = resolve(ctx, vals[0])
+                stdin = count_lines(path)
+                if stdin:
+                    ctx.reads.append((path, stdin))
+        elif op in ("<<", "<<-", "<<<"):
+            stdin = 0
+    out = eval_cmd(stmt.get("Cmd"), ctx, stdin)
+    for r in redirs:
+        op = r.get("Op")
+        fd = (r.get("N") or {}).get("Value")
+        if op in (">", ">>", ">|") and fd in (None, "1"):
+            out = 0
+        elif op in ("&>", "&>>"):
+            out = 0
+    return out
+
+
+def eval_if(node, ctx, stdin):
+    total = eval_stmts(node.get("Cond") or [], ctx, stdin)
+    total += eval_stmts(node.get("Then") or [], ctx, 0)
+    if node.get("Else"):
+        total += eval_if(node["Else"], ctx, 0)
+    return total
+
+
+def eval_cmd(cmd, ctx, stdin):
+    if not cmd:
+        return 0
+    t = cmd.get("Type")
+    if t == "CallExpr":
+        return eval_call(cmd, ctx, stdin)
+    if t == "BinaryCmd":
+        op = cmd.get("Op")
+        if op in ("|", "|&"):
+            left = eval_stmt(cmd.get("X"), ctx.fork(), stdin)
+            return eval_stmt(cmd.get("Y"), ctx.fork(), left)
+        return eval_stmt(cmd.get("X"), ctx, stdin) + eval_stmt(cmd.get("Y"), ctx, 0)
+    if t == "Subshell":
+        return eval_stmts(cmd.get("Stmts") or [], ctx.fork(), stdin)
+    if t == "Block":
+        return eval_stmts(cmd.get("Stmts") or [], ctx, stdin)
+    if t == "IfClause":
+        return eval_if(cmd, ctx, stdin)
+    if t == "WhileClause":
+        return eval_stmts(cmd.get("Cond") or [], ctx, stdin) + eval_stmts(cmd.get("Do") or [], ctx, 0)
+    if t == "ForClause":
+        loop, body = cmd.get("Loop") or {}, cmd.get("Do") or []
+        if loop.get("Type") != "WordIter":
+            return eval_stmts(body, ctx, 0)
+        name = (loop.get("Name") or {}).get("Value")
+        values = []
+        for w in loop.get("Items") or []:
+            vals = word_values(w, ctx)
+            if vals is None:
+                values = None
+                break
+            values.extend(vals)
+        if not values:
+            return eval_stmts(body, ctx, 0)
+        total = 0
+        for v in values[:LOOP_CAP]:
+            ctx.env[name] = v
+            total += eval_stmts(body, ctx, 0)
+        ctx.env.pop(name, None)
+        return total
+    if t == "CaseClause":
+        return sum(eval_stmts(item.get("Stmts") or [], ctx, 0) for item in cmd.get("Items") or [])
+    if t == "TimeClause":
+        return eval_stmt(cmd.get("Stmt"), ctx, stdin)
+    return 0  # FuncDecl, ArithmCmd, TestClause, DeclClause, ...
+
+
+# --- hook -----------------------------------------------------------------------
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.environ.get("HOME", "/tmp"), ".local/state")
+    return os.environ.get("SHUNT_STATE") or os.path.join(base, "shunt")
+
+
+def log_block(sid, path, lines):
+    funnel = os.environ.get("SHUNT_FUNNEL") or os.path.join(state_dir(), "funnel.jsonl")
+    try:
+        os.makedirs(os.path.dirname(funnel), exist_ok=True)
+        with open(funnel, "a") as f:
+            f.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "ev": "block", "sid": sid, "path": path, "lines": str(lines), "tool": "Bash",
+            }, separators=(",", ":")) + "\n")
+    except OSError:
+        pass  # a lost measurement, never a stuck session
+
+
+def graphify_hint(path):
+    lib = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "graphify.sh")
+    try:
+        return subprocess.run(
+            ["bash", "-c", '. "$1"; graphify_hint "$2"', "_", lib, path],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.rstrip("\n")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def main():
+    if os.environ.get("SHUNT_DISABLE") == "1":
+        allow()
+    raw = os.environ.get("SHUNT_MIN_LINES", "")
+    min_lines = int(raw) if raw.isdigit() else MIN_LINES_DEFAULT
+
+    data = json.load(sys.stdin)
+    command = (data.get("tool_input") or {}).get("command") or ""
+    if not command or not TRIAGE.search(command):
+        allow()  # hot path: no reading verb anywhere, no parse
+
+    try:
+        ast = json.loads(subprocess.run(
+            ["shfmt", "--to-json", "-ln", "bash"], input=command,
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        allow()  # unparsable (or no shfmt): not ours to judge
+
+    cwd = data.get("cwd") or os.getcwd()
+    ctx = Ctx(cwd, {})
+    total = eval_stmts(ast.get("Stmts") or [], ctx, 0)
+    if total <= min_lines:
+        allow()
+
+    by_path = {}
+    for path, n in ctx.reads:
+        by_path[path] = by_path.get(path, 0) + n
+    biggest = sorted(by_path.items(), key=lambda kv: -kv[1])[:5]
+    top = biggest[0][0] if biggest else ""
+    log_block(data.get("session_id") or "?", top, total)
+
+    listing = "\n".join(f"  {p} ({n} lines)" for p, n in biggest)
+    paths = " ".join(p for p, _ in biggest)
+    reason = (
+        f"This command would put ~{total} lines into your context (threshold: {min_lines}), "
+        f"counted across the whole command line — loops, `cd` and multiple files included.\n"
+        f"{listing}"
+        f"{graphify_hint(top) if top else ''}\n\n"
+        f"To ingest the content anyway, delegate instead:\n"
+        f"  shunt-bulk-read --question \"<question>\" --paths {paths}\n"
+        f"For a specific slice, use grep, sed -n 'A,Bp' or head/tail with N under {min_lines}, "
+        f"or send the output to a file and grep that."
+    )
+    json.dump({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}, sys.stdout)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001 — a hook bug must never block a command
+        sys.exit(0)

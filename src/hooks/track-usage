@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# PostToolUse on Bash|Read: record what happened AFTER a block.
+#
+# Runs on every Bash and Read call, so the hot path is doing nothing. Triage is
+# therefore a `case` over the raw stdin text: jq is only paid for when the event
+# actually matters. Measured: ~1ms when discarding, ~20ms when recording (and by
+# then a real command has already run).
+
+[ "${SHUNT_DISABLE:-0}" = "1" ] && exit 0
+
+input=$(cat)
+
+# Cheap triage. None of these needles present => nothing to record.
+case "$input" in
+  *graphify*|*bulk-read*|*code-write*|*offset*|*limit*) ;;
+  *) exit 0 ;;
+esac
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/ledger.sh"
+
+sid=$(printf '%s' "$input" | jq -r '.session_id // "?"' 2>/dev/null)
+tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null)
+
+case "$tool" in
+  Bash)
+    cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
+    case "$cmd" in
+      *graphify\ query*|*graphify\ explain*|*graphify\ path*)
+        shunt_log graph "$sid" cmd "${cmd:0:200}" ;;
+      *bulk-read*)
+        # bulk-read's --paths is what ties this line to the block.
+        p=$(printf '%s' "$cmd" | sed -nE 's/.*--paths[[:space:]]+([^[:space:]]+).*/\1/p')
+        shunt_log bulk "$sid" path "$p" ;;
+      *code-write*)
+        shunt_log write "$sid" cmd "${cmd:0:200}" ;;
+    esac
+    ;;
+  Read)
+    # Only a TARGETED re-read counts: it is the right answer to a block when
+    # the goal was editing. A whole-file Read never gets here — it was denied.
+    #
+    # jq decides AND extracts in one call. Reading the three fields as @tsv and
+    # splitting in the shell looked simpler and was wrong: with an empty offset
+    # the fields slide and the path becomes the limit.
+    path=$(printf '%s' "$input" | jq -r '
+      if (.tool_input.offset != null or .tool_input.limit != null)
+      then (.tool_input.file_path // empty) else empty end' 2>/dev/null)
+    [ -n "$path" ] && shunt_log reread "$sid" path "$path"
+    ;;
+esac
+exit 0

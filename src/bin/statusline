@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Claude Code status line: the numbers that decide what a session costs.
+#
+# Measured on this machine's transcripts (week 2026-09-08..15), per call:
+#
+#   cost = 0.1*C + 2*(d + rho*C) + 5*o        (Opus 5 weights, input = 1)
+#
+# C is the context re-read on every call (70% of the bill), rho*C the full
+# rewrite when the cache is invalidated or has gone cold (10%), o the output.
+# So the line shows C, what will be rewritten if the cache goes cold, why the
+# cache missed, and the 5-hour window -- the moments to hand off to the board
+# and clear, before a limit stop leaves a huge context to resume cold (a
+# single cold resume measured 332k-1.86M input-equivalent units).
+#
+# Thresholds (environment):
+#   SHUNT_HANDOFF_TOKENS  context that warrants a handoff   (default 200000;
+#                         the optimum segment for d = 2.3k tokens/call)
+#   SHUNT_HANDOFF_5H      5-hour window percentage          (default 85)
+#   SHUNT_CACHE_WARN_MIN  minutes left before a warm cache  (default 5)
+#                         is shown as about to go cold
+#   NO_COLOR              any value disables ANSI colour
+set -u
+
+int_or() { case "${1:-}" in '' | *[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+handoff_tokens=$(int_or "${SHUNT_HANDOFF_TOKENS:-}" 200000)
+handoff_5h=$(int_or "${SHUNT_HANDOFF_5H:-}" 85)
+cache_warn=$(int_or "${SHUNT_CACHE_WARN_MIN:-}" 5)
+cols=$(int_or "${COLUMNS:-}" 120)
+color=1
+[ -n "${NO_COLOR:-}" ] && color=0
+
+# One jq process: the status line runs after every assistant message and on a
+# timer, so it must stay cheap. A malformed payload prints nothing rather than
+# an error in the footer.
+jq -r \
+  --argjson ht "$handoff_tokens" --argjson h5 "$handoff_5h" \
+  --argjson cw "$cache_warn" --argjson cols "$cols" --argjson color "$color" '
+  def paint($code; $s): if $color == 1 then "[\($code)m\($s)[0m" else $s end;
+  def k: if . >= 1000000 then "\(. / 100000 | floor | . / 10)M"
+         elif . >= 1000 then "\(. / 1000 | floor)k"
+         else "\(. | floor)" end;
+  now as $now
+  | [
+      ([.model.display_name, .effort.level] | map(select(. != null)) | join(" ")),
+
+      (.context_window.total_input_tokens as $t
+       | if $t == null then empty
+         elif $t >= 2 * $ht then paint("31"; "ctx \($t | k) ⚑ handoff")
+         elif $t >= $ht then paint("33"; "ctx \($t | k) ⚑ handoff")
+         else paint("32"; "ctx \($t | k)") end),
+
+      (.rate_limits.five_hour as $f
+       | if $f == null or $f.used_percentage == null then empty else
+           ($f.used_percentage | floor) as $p
+           | (if $f.resets_at == null then "" else " ↺\($f.resets_at | strflocaltime("%H:%M"))" end) as $r
+           | if $p >= $h5 then paint("31"; "5h \($p)%\($r) ⚑ handoff")
+             elif $p >= 70 then paint("33"; "5h \($p)%\($r)")
+             else "5h \($p)%\($r)" end
+         end),
+
+      (if $cols >= 100 and .rate_limits.seven_day.used_percentage != null
+       then paint("2"; "7d \(.rate_limits.seven_day.used_percentage | floor)%") else empty end),
+
+      (.prompt_cache as $pc
+       | if $pc == null or $pc.caching_observed != true then empty
+         elif $pc.warm == true and $pc.expires_at != null then
+           ((($pc.expires_at - $now) / 60) | floor | if . < 0 then 0 else . end) as $m
+           | if $m < $cw then paint("33"; "cache ● \($m)m") else paint("32"; "cache ● \($m)m") end
+         elif $pc.warm == true then paint("32"; "cache ●")
+         else paint("31"; "cache ○ cold, next call re-caches \(($pc.recache_tokens_if_cold // 0) | k)") end),
+
+      (.prompt_cache as $pc
+       | if ($pc.misses // 0) > 0
+         then paint("35"; "miss ×\($pc.misses)\(($pc.last_miss_cause.causes // [])[0] // "" | if . == "" then "" else " " + . end)")
+         else empty end)
+    ]
+  | map(select(. != null and . != ""))
+  | join(" · ")
+' 2>/dev/null || true

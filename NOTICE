@@ -1,0 +1,10 @@
+ctx
+Copyright 2026 Thiago Pereira Roldan
+
+This product is derived from shunt, a Claude Code plugin in Spotify's
+portal-ai-plugins (https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt),
+licensed under the Apache License, Version 2.0.
+
+The files that came from shunt were modified: the hooks, the plugin manifest,
+the bulk-reader and code-writer skills, and the delegation scripts. README.md,
+under "Where this port diverges from upstream", describes how.

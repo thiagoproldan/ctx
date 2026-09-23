@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# PreToolUse on Read: deny a whole-file read above the threshold and point at
+# delegation. Self-contained: the whole decision lives here, no CLAUDE.md needed.
+
+deny() {
+  jq -n --arg r "$1" '{hookSpecificOutput:{hookEventName:"PreToolUse",
+                                            permissionDecision:"deny",
+                                            permissionDecisionReason:$r}}'
+  exit 0
+}
+allow() { exit 0; }   # nothing on stdout => normal permission flow
+
+[ "${SHUNT_DISABLE:-0}" = "1" ] && allow
+
+# 350 is the article's default. The first port used 2000, which made this hook
+# nearly dead code: Claude Code's Read already stops at 2000 lines by itself,
+# so every 350–2000 line file — where the saving is — went straight in.
+MIN_LINES="${SHUNT_MIN_LINES:-350}"
+case "$MIN_LINES" in ''|*[!0-9]*) MIN_LINES=350 ;; esac
+
+input=$(cat)
+file_path=$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty')
+offset=$(printf '%s'   "$input" | jq -r '.tool_input.offset    // empty')
+limit=$(printf '%s'    "$input" | jq -r '.tool_input.limit     // empty')
+
+# A targeted read (offset/limit) passes: Claude already knows the slice it wants.
+if [ -n "$offset" ] || [ -n "$limit" ]; then allow; fi
+[ -z "$file_path" ] && allow
+[ -f "$file_path" ] || allow
+
+# Non-text (images, PDFs, notebooks) is not bulk-read work.
+case "$file_path" in
+  *.png|*.jpg|*.jpeg|*.gif|*.webp|*.svg|*.pdf|*.ipynb) allow ;;
+esac
+
+lines=$(wc -l < "$file_path" 2>/dev/null | tr -d ' ' || echo 0)
+[ "$lines" -le "$MIN_LINES" ] && allow
+
+# Only from here on is it worth looking for an index and logging: an allowed
+# read pays for none of this.
+LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib"
+. "$LIB/graphify.sh"
+. "$LIB/ledger.sh"
+shunt_log block "$(printf '%s' "$input" | jq -r '.session_id // "?"')" \
+  path "$file_path" lines "$lines" tool Read
+
+deny "File has ${lines} lines (threshold: ${MIN_LINES}).$(graphify_hint "$file_path")
+
+To ingest the content anyway, delegate instead of reading it directly:
+  shunt-bulk-read --question \"<question>\" --paths ${file_path}
+If you are going to edit, re-read only the slice you need with offset/limit."

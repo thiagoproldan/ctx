@@ -1,0 +1,35 @@
+{
+  "name": "shunt",
+  "version": "@version@",
+  "description": "Routes bulk reads and boilerplate generation to a cheap non-Claude worker (Gemini via agy, sandboxed), and blocks commands that would dump big files into context.",
+  "homepage": "https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          { "type": "command", "command": "@root@/hooks/check-file-size" }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "@root@/hooks/check-bash-read" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Read",
+        "hooks": [{ "type": "command", "command": "@root@/hooks/track-usage" }]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "@root@/hooks/announce-graph" }
+        ]
+      }
+    ]
+  }
+}
