@@ -8,7 +8,7 @@
 #
 # Silence is the normal case: no graph or no binary costs zero tokens.
 
-[ "${SHUNT_DISABLE:-0}" = "1" ] && exit 0
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/graphify.sh"
 

@@ -15,11 +15,11 @@ graphify path "<A>" "<B>"    --graph <root>/graphify-out/graph.json
 ```
 
 The blocking hooks already detect the index and build these commands with the
-right path when it exists. `shunt-bulk-read` is for what no graph indexes — logs,
+right path when it exists. `ctx-bulk-read` is for what no graph indexes — logs,
 dumps, generated files, huge diffs — and for when there is no index:
 
 ```bash
-shunt-bulk-read --question "<question>" --paths <file1> [<file2> ...]
+ctx-bulk-read --question "<question>" --paths <file1> [<file2> ...]
 ```
 
 The files go to the worker (Gemini Flash through `agy`, on the Gemini
@@ -40,5 +40,5 @@ The hooks count what a whole command line would print — `cd`, loops, several
 files and pipes included — so splitting a dump into ten small `cat`s does not
 get around them; delegating does.
 
-Variables: `SHUNT_MODEL` (default `gemini-3.8-flash-medium`), `SHUNT_TIMEOUT_SECONDS`
-(300), `SHUNT_MAX_PAYLOAD_BYTES` (2000000 ≈ 500k tokens).
+Variables: `CTX_MODEL` (default `gemini-3.8-flash-medium`), `CTX_TIMEOUT_SECONDS`
+(300), `CTX_MAX_PAYLOAD_BYTES` (2000000 ≈ 500k tokens).

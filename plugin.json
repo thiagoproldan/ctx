@@ -1,8 +1,8 @@
 {
-  "name": "shunt",
+  "name": "ctx",
   "version": "@version@",
-  "description": "Routes bulk reads and boilerplate generation to a cheap non-Claude worker (Gemini via agy, sandboxed), and blocks commands that would dump big files into context.",
-  "homepage": "https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90",
+  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends.",
+  "homepage": "https://github.com/thiagoproldan/ctx",
   "hooks": {
     "PreToolUse": [
       {
@@ -29,6 +29,11 @@
         "hooks": [
           { "type": "command", "command": "@root@/hooks/announce-graph" }
         ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "@root@/hooks/handoff" }]
       }
     ]
   }

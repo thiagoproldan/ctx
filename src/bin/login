@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Sign agy in for the sandboxed worker. Run once, in a terminal.
-# Usage: shunt-login [--force]
+# Usage: ctx-login [--force]
 #
 # The worker never sees the user's keyring (see lib/transport.sh). It has its own
-# home, $SHUNT_WORKER_HOME, and this runs agy interactively inside the worker's
+# home, $CTX_WORKER_HOME, and this runs agy interactively inside the worker's
 # sandbox with that home writable, so the sign-in lands there — in agy's token
 # file, which it uses when there is no D-Bus session — and nowhere else.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/transport.sh"
@@ -18,29 +18,29 @@ for c in agy bwrap jq; do
   }
 done
 [ -t 0 ] && [ -t 1 ] || {
-  echo "Error: shunt-login is interactive; run it in a terminal." >&2
+  echo "Error: ctx-login is interactive; run it in a terminal." >&2
   exit 1
 }
 
 # check_login — one tiny call through the real (non-login) sandbox.
 check_login() {
   local out
-  out=$(shunt_sandbox "$(command -v agy)" --output-format json \
-    --model "$SHUNT_MODEL" --disable-slash-commands -p='Reply with exactly: ok' 2>/dev/null)
+  out=$(ctx_sandbox "$(command -v agy)" --output-format json \
+    --model "$CTX_MODEL" --disable-slash-commands -p='Reply with exactly: ok' 2>/dev/null)
   [ "$(printf '%s' "$out" | jq -r '.status // empty' 2>/dev/null)" = "SUCCESS" ]
 }
 
-mkdir -p "$SHUNT_WORKER_HOME"
-chmod 700 "$SHUNT_WORKER_HOME"
+mkdir -p "$CTX_WORKER_HOME"
+chmod 700 "$CTX_WORKER_HOME"
 
-if [ "$force" -eq 0 ] && [ -d "$SHUNT_WORKER_HOME/.gemini" ] && check_login; then
-  echo "The worker is already signed in ($SHUNT_WORKER_HOME). Use --force to sign in again."
+if [ "$force" -eq 0 ] && [ -d "$CTX_WORKER_HOME/.gemini" ] && check_login; then
+  echo "The worker is already signed in ($CTX_WORKER_HOME). Use --force to sign in again."
   exit 0
 fi
 
 cat <<EOF
 agy will start inside the worker's sandbox, with its own home at
-  $SHUNT_WORKER_HOME
+  $CTX_WORKER_HOME
 It cannot open a browser from in there: open the sign-in URL it shows in your
 own browser, use the Google account of your Gemini subscription, and finish
 the flow (paste the code back if it asks for one).
@@ -49,14 +49,14 @@ Once agy is signed in and waiting for a prompt, quit it (/exit or Ctrl+C).
 EOF
 read -r -p "Press Enter to start... " _
 
-shunt_sandbox --login "$(command -v agy)"
+ctx_sandbox --login "$(command -v agy)"
 
 echo
 echo "Checking the login from inside the call sandbox..."
 if check_login; then
-  echo "OK: the worker is signed in. \`shunt-test --live\` exercises it end to end."
+  echo "OK: the worker is signed in. \`ctx-test --live\` exercises it end to end."
 else
   echo "Error: agy still reports no usable login inside the sandbox." >&2
-  echo "Run \`shunt-login --force\` and make sure the sign-in completes before quitting agy." >&2
+  echo "Run \`ctx-login --force\` and make sure the sign-in completes before quitting agy." >&2
   exit 1
 fi

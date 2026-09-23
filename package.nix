@@ -31,12 +31,12 @@ let
     jq
     python3
     shfmt
-    systemd # busctl, for `shunt-test --live`
+    systemd # busctl, for `ctx-test --live`
   ];
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
-  pname = "shunt";
-  version = "2.0.0";
+  pname = "ctx";
+  version = "0.1.0";
 
   src = ./src;
 
@@ -52,7 +52,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   installPhase = ''
     runHook preInstall
 
-    root=$out/share/shunt
+    root=$out/share/ctx
     mkdir -p $root $out/bin
     cp -r hooks lib bin skills report.sh test-hooks.sh $root/
     chmod +x $root/hooks/* $root/bin/* $root/report.sh $root/test-hooks.sh
@@ -69,16 +69,16 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   '';
 
   postFixup = ''
-    root=$out/share/shunt
+    root=$out/share/ctx
     for f in $root/hooks/* $root/bin/* $root/report.sh $root/test-hooks.sh; do
       wrapProgram "$f" --suffix PATH : ${runtimePath}
     done
-    makeWrapper $root/bin/bulk-read  $out/bin/shunt-bulk-read
-    makeWrapper $root/bin/code-write $out/bin/shunt-code-write
-    makeWrapper $root/bin/login      $out/bin/shunt-login
-    makeWrapper $root/bin/statusline $out/bin/shunt-statusline
-    makeWrapper $root/report.sh      $out/bin/shunt-report
-    makeWrapper $root/test-hooks.sh  $out/bin/shunt-test
+    makeWrapper $root/bin/bulk-read  $out/bin/ctx-bulk-read
+    makeWrapper $root/bin/code-write $out/bin/ctx-code-write
+    makeWrapper $root/bin/login      $out/bin/ctx-login
+    makeWrapper $root/bin/statusline $out/bin/ctx-statusline
+    makeWrapper $root/report.sh      $out/bin/ctx-report
+    makeWrapper $root/test-hooks.sh  $out/bin/ctx-test
   '';
 
   # The hermetic suite runs against the installed, wrapped hooks: what ships is
@@ -86,15 +86,16 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
-    HOME=$TMPDIR $out/bin/shunt-test
+    HOME=$TMPDIR $out/bin/ctx-test
     runHook postInstallCheck
   '';
 
   meta = {
-    description = "Claude Code plugin that shunts bulk reads and boilerplate to a sandboxed Gemini worker";
-    homepage = "https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90";
-    license = lib.licenses.mit;
+    description = "Claude Code plugin that keeps the context small: bulk reads go to a sandboxed Gemini worker, and past a threshold the session hands off to ekko";
+    homepage = "https://github.com/thiagoproldan/ctx";
+    # Upstream shunt's license (spotify/portal-ai-plugins); see NOTICE.
+    license = lib.licenses.asl20;
     platforms = lib.platforms.linux;
-    mainProgram = "shunt-report";
+    mainProgram = "ctx-report";
   };
 })

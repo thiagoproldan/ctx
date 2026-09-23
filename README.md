@@ -1,23 +1,34 @@
-# shunt
+# ctx
 
-A local port of Spotify's [`shunt`](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt)
+Keeps Claude Code's context small, and hands off to
+[ekko](https://github.com/thiagoproldan/ekko) before it grows.
+
+ctx is a fork of shunt, this machine's port of Spotify's
+[`shunt`](https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt)
 Claude Code plugin, described in _[Portal by Spotify cut my Claude Code token
-usage by 90%](https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90)_.
+usage by 90%](https://engineering.atspotify.com/2026/9/portal-by-spotify-cut-my-claude-code-token-usage-by-90)_,
+which lived in the NixOS configuration until this repository took it over.
 
-One idea: **I/O work does not need the expensive model.** Reading 6,000 lines to
-answer "what does this module do?" and generating predictable boilerplate are
-jobs a cheap model handles — and what comes back into the expensive context is
-the answer, not the file. What the plugin adds to the idea is _enforcement_:
-hooks block the big read instead of trusting someone to remember.
+Two ideas:
 
-Installed by `usr.shunt` (`modules/usr/shunt.nix`) into every Claude Code
-profile, as a skills-directory plugin, the same way `usr.ekko` is.
+- **I/O work does not need the expensive model.** Reading 6,000 lines to answer
+  "what does this module do?" and generating predictable boilerplate are jobs a
+  cheap model handles — and what comes back into the expensive context is the
+  answer, not the file.
+- **A long session pays for its whole context on every call.** Re-reading the
+  context is most of the bill; a handoff to the board and a `/clear` drop it.
+
+What the plugin adds to both is _enforcement_: hooks block the big read, and
+hold the turn for the handoff, instead of trusting someone to remember.
+
+Installed from this flake into every Claude Code profile, as a skills-directory
+plugin, the same way ekko is.
 
 ## Layers
 
 1. **Hooks** (`src/hooks/`, wired by `plugin.json`)
    - `check-file-size` — `PreToolUse` on `Read`: a whole-file read above
-     `SHUNT_MIN_LINES` (350) is denied with a message that teaches the right path.
+     `CTX_MIN_LINES` (350) is denied with a message that teaches the right path.
      `offset`/`limit` reads pass.
    - `check-bash-read` — `PreToolUse` on `Bash`: parses the command with `shfmt`
      and denies it if the whole command line would print more than the threshold.
@@ -25,9 +36,52 @@ profile, as a skills-directory plugin, the same way `usr.ekko` is.
      so on turn zero.
    - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
      block, for the funnel.
-2. **Scripts** — `shunt-bulk-read` and `shunt-code-write` do the delegation;
-   `shunt-report` and `shunt-test` measure and verify.
+   - `handoff` — `Stop`: past `CTX_HANDOFF_TOKENS` of context (250k), or the
+     5-hour window past `CTX_HANDOFF_5H` (85%), keeps the turn open once and
+     asks for the ekko handoff and a `/clear`.
+2. **Scripts** — `ctx-bulk-read` and `ctx-code-write` do the delegation;
+   `ctx-report` and `ctx-test` measure and verify; `ctx-statusline` draws the
+   status line.
 3. **Skills** — `bulk-reader` and `code-writer` say when and how to call them.
+
+## The handoff
+
+The status line has said `ctx Nk ⚑ handoff` since 2026-09-15, and the clears
+still came late and by eye: on 2026-09-21 at 199k, 349k, 356k, 506k and 719k
+of context. Every call re-reads the whole context, so each of those segments
+paid for tokens a handoff would have dropped.
+
+A replay of 30 days of this machine's transcripts (344 sessions) priced the
+policy "reset at the end of any turn that closes above T" against what was
+actually done. T = 250k saves 22–25% of the bill net (the range is how much
+nuance a reset loses: none, or ten extra calls each), about 90% of what 200k
+saves with about 30% fewer resets — and each reset costs the user a `/clear`
+and the next session a few minutes of orientation. Hence the default.
+
+At the end of each turn, the `handoff` hook:
+
+- reads the context from the end of the transcript: the last main-thread
+  call's input, cache writes and cache reads. A subagent's replies do not
+  count, and neither does a line still being written;
+- past the threshold, keeps the turn open once — as `additionalContext`, which
+  Claude Code shows as _Stop hook feedback_, not as an error — asking for the
+  handoff on the task in progress: where it stopped, what was decided and why,
+  the files, and the next step as an action the next session takes at once,
+  without exploring first. Then one line telling the user to `/clear`;
+- asks once per band: at T, again at 2T, 3T…; a compaction re-arms the bands
+  it came back under;
+- asks when the 5-hour window passes `CTX_HANDOFF_5H`, once, re-armed when the
+  window comes back under it. A Stop hook's input carries no rate limits, so
+  the status line leaves each session's reading in `$CTX_STATE/sessions/`, and
+  the hook trusts it for 10 minutes;
+- stays quiet while a stop hook is already continuing the turn, and while
+  background work or a scheduled wakeup would resume the session — a `/clear`
+  then would drop it. It asks at the next stop instead;
+- logs each ask to `$CTX_STATE/handoff.jsonl`.
+
+In a folder without an ekko board, the ask only tells the user. ekko needs
+nothing new for this: the handoff is an ekko note of kind `handoff`, which the
+next session's prime shows first.
 
 ## The worker: Gemini through `agy`, sandboxed
 
@@ -44,7 +98,7 @@ Two things about `agy` had to be dealt with:
 
 - **No stdin for `-p`, and argv caps one argument at 128 KB.** The turn goes in
   as one NDJSON event through `--input-format stream-json`, which does read stdin.
-  The cap becomes the worker's context (`SHUNT_MAX_PAYLOAD_BYTES`, 2 MB).
+  The cap becomes the worker's context (`CTX_MAX_PAYLOAD_BYTES`, 2 MB).
 - **`agy` is an agent with every tool auto-approved in print mode** —
   `run_command`, `write_to_file`, web access — and no flag turns that off
   (`--mode plan` does not; measured). The worker reads untrusted text, so a prompt
@@ -54,11 +108,11 @@ Two things about `agy` had to be dealt with:
     no `/projects`, no `/run/secrets`;
   - no D-Bus at all: no keyring, and no `systemd --user` — the session bus would
     let the worker start a process outside the sandbox;
-  - its home is its **own**, `~/.local/state/shunt/worker-home`, mounted as an
+  - its home is its **own**, `~/.local/state/ctx/worker-home`, mounted as an
     ephemeral overlay: nothing the worker writes survives the call — its
     conversation history, its config, an MCP server an injection tries to add.
 
-  `shunt-test --live` checks these walls directly (writes reach neither `$HOME`
+  `ctx-test --live` checks these walls directly (writes reach neither `$HOME`
   nor the worker home, no user directories, keyring or bus are visible, systemd
   is unreachable) and makes one real call of each kind.
 
@@ -71,8 +125,8 @@ falls back to a token file when there is no D-Bus session (its changelog:
 its own home, signed in once:
 
 ```bash
-shunt-login          # interactive: open the URL it shows in your browser
-shunt-login --force  # sign in again (expired or revoked token)
+ctx-login          # interactive: open the URL it shows in your browser
+ctx-login --force  # sign in again (expired or revoked token)
 ```
 
 It runs `agy` inside the same walls with the worker home writable, then checks
@@ -89,12 +143,12 @@ Gemini token, and the network the model API needs.
 | `head`/`tail` only count as a dump when N exceeds the threshold                              | `head file` shows 10 lines. Upstream blocks it anyway — punishing the targeted read the plugin wants to encourage.                                                                                                                                                                                                               |
 | `code-write --target` refuses to overwrite without `--force`, and checks the directory first | The output passes through nobody's context: a wrong target erases a file silently. An unwritable target only surfaced _after_ paying for the generation.                                                                                                                                                                         |
 | Worker sandbox                                                                               | See above.                                                                                                                                                                                                                                                                                                                       |
-| Ledger + funnel + session metrics (`shunt-report`)                                           | The article's 90% is theirs. This measures yours.                                                                                                                                                                                                                                                                                |
+| Ledger + funnel + session metrics (`ctx-report`)                                           | The article's 90% is theirs. This measures yours.                                                                                                                                                                                                                                                                                |
 
 ## Integration with graphify
 
 The two cut tokens in different halves: graphify cuts the cost of **finding**
-(querying an AST graph instead of opening five files), shunt cuts the cost of
+(querying an AST graph instead of opening five files), ctx cuts the cost of
 **ingesting** a big file you already know. A structural question delegated to a
 cheap model pays for a worse answer than the graph gives for free.
 
@@ -118,7 +172,7 @@ been"_. The funnel does: each block has exactly four outcomes, and only one is b
 | --------------------------- | ------------------------------------------------- |
 | queried the graph           | great                                             |
 | re-read with `offset/limit` | great — it was an edit                            |
-| called `shunt-bulk-read`    | fine                                              |
+| called `ctx-bulk-read`    | fine                                              |
 | **nothing**                 | the hook was ignored and the information was lost |
 
 A block's outcome is the first relevant event **of the same session** between it
@@ -127,7 +181,7 @@ and that session's next block — without that window, one graph query would
 
 ## Is it worth it for how you work?
 
-`shunt-report` section 3 reads the Claude Code transcripts of every profile and
+`ctx-report` section 3 reads the Claude Code transcripts of every profile and
 splits tool output by tool, plus how much of it came in results over the
 threshold — the share a hook could still catch. When this port was rebuilt
 (2026-09-15), that share was 11% over the previous week: most context came from many small Bash
@@ -138,17 +192,17 @@ Compare windows with `--since`/`--until` to see what a change actually did.
 ## Usage
 
 ```bash
-shunt-bulk-read  --question "what does this do?" --paths a.py b.py
-shunt-code-write --spec "tests for X" --reference ref_test.py --target new_test.py
-shunt-report [--since 2026-09-08] [--until 2026-09-15]
-shunt-login [--force]
-shunt-statusline   # Claude Code runs it; reads the status-line JSON on stdin
-shunt-test [--live]
+ctx-bulk-read  --question "what does this do?" --paths a.py b.py
+ctx-code-write --spec "tests for X" --reference ref_test.py --target new_test.py
+ctx-report [--since 2026-09-08] [--until 2026-09-15]
+ctx-login [--force]
+ctx-statusline   # Claude Code runs it; reads the status-line JSON on stdin
+ctx-test [--live]
 ```
 
 ## Status line
 
-`shunt-statusline` shows the terms that decide what a session costs. Per call,
+`ctx-statusline` shows the terms that decide what a session costs. Per call,
 with Opus 5 weights, cost = 0.1·C + 2·(d + ρ·C) + 5·o: the context re-read on
 every call (70% of the measured bill), the full rewrite when the cache is
 invalidated or cold (10%), and the output. So it shows:
@@ -156,13 +210,13 @@ invalidated or cold (10%), and the output. So it shows:
 | Segment                                                  | Meaning                                                               |
 | -------------------------------------------------------- | --------------------------------------------------------------------- |
 | `Opus 5 max`                                             | model and effort — changing either mid-session invalidates the cache  |
-| `ctx 212k ⚑ handoff`                                     | context tokens; yellow from `SHUNT_HANDOFF_TOKENS`, red at twice that |
-| `5h 87% ↺14:30 ⚑ handoff`                                | 5-hour window and its reset; handoff from `SHUNT_HANDOFF_5H`          |
+| `ctx 212k ⚑ handoff`                                     | context tokens; yellow from `CTX_HANDOFF_TOKENS`, red at twice that |
+| `5h 87% ↺14:30 ⚑ handoff`                                | 5-hour window and its reset; handoff from `CTX_HANDOFF_5H`          |
 | `7d 41%`                                                 | 7-day window, on terminals at least 100 columns wide                  |
 | `cache ● 38m` / `cache ○ cold, next call re-caches 612k` | minutes until the cache goes cold, or what the next call will rewrite |
 | `miss ×2 tools_changed`                                  | cache misses this session and the last cause Claude Code diagnosed    |
 
-`usr.shunt` wires it through a `claude` wrapper that adds `--settings` with the
+The NixOS module wires it through a `claude` wrapper that adds `--settings` with the
 status line: command-line settings rank above user settings, so every profile
 gets it while `settings.json` stays mutable, and a plugin cannot carry a status
 line. The wrapper leaves subcommands alone — on 2.1.272, `attach`, `kill`, `logs`,
@@ -171,30 +225,36 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 
 ## Variables
 
-| Var                       | Default                    | What                                           |
-| ------------------------- | -------------------------- | ---------------------------------------------- |
-| `SHUNT_MIN_LINES`         | `350`                      | Block threshold                                |
-| `SHUNT_MODEL`             | `gemini-3.8-flash-medium`  | Worker model (`agy models` lists them)         |
-| `SHUNT_TIMEOUT_SECONDS`   | `300`                      | Cap per call                                   |
-| `SHUNT_MAX_PAYLOAD_BYTES` | `2000000`                  | Payload cap                                    |
-| `SHUNT_DISABLE`           | —                          | `1` disarms **every** hook                     |
-| `SHUNT_STATE`             | `~/.local/state/shunt`     | Where the ledger, funnel and worker home live  |
-| `SHUNT_WORKER_HOME`       | `$SHUNT_STATE/worker-home` | The worker's own home, holding its `agy` login |
-| `GRAPHIFY_OUT`            | `graphify-out`             | Read, never set here — honours graphify's own  |
-| `SHUNT_HANDOFF_TOKENS`    | `200000`                   | Status line: context that warrants a handoff   |
-| `SHUNT_HANDOFF_5H`        | `85`                       | Status line: 5-hour percentage for a handoff   |
-| `SHUNT_CACHE_WARN_MIN`    | `5`                        | Status line: minutes left before cache is cold |
+| Var                     | Default                   | What                                                               |
+| ----------------------- | ------------------------- | ------------------------------------------------------------------ |
+| `CTX_MIN_LINES`         | `350`                     | Block threshold                                                    |
+| `CTX_MODEL`             | `gemini-3.8-flash-medium` | Worker model (`agy models` lists them)                             |
+| `CTX_TIMEOUT_SECONDS`   | `300`                     | Cap per call                                                       |
+| `CTX_MAX_PAYLOAD_BYTES` | `2000000`                 | Payload cap                                                        |
+| `CTX_DISABLE`           | —                         | `1` disarms **every** hook                                         |
+| `CTX_STATE`             | `~/.local/state/ctx`      | Where the ledgers, session readings and worker home live           |
+| `CTX_WORKER_HOME`       | `$CTX_STATE/worker-home`  | The worker's own home, holding its `agy` login                     |
+| `GRAPHIFY_OUT`          | `graphify-out`            | Read, never set here — honours graphify's own                      |
+| `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
+| `CTX_HANDOFF_5H`        | `85`                      | Status line and Stop hook: 5-hour percentage for a handoff         |
+| `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
+
+## Moving from shunt
+
+Every `SHUNT_` variable is now `CTX_`, and every `shunt-` command `ctx-`. The
+state moved from `~/.local/state/shunt` to `~/.local/state/ctx`: move the
+directory to keep the worker's login and the ledgers, or run `ctx-login` once.
 
 ## What it does not solve
 
 The worker is cheap, not good. Its answer is an **unverified** summary: check on
 disk (`sed -n 'N,Mp'`) any exact line or value before using it in an edit, and
-run the tests of whatever `shunt-code-write` generates. The gain is in not
+run the tests of whatever `ctx-code-write` generates. The gain is in not
 loading 80k tokens of file for a 900-token question — not in trusting the answer.
 
 ## graphify on NixOS
 
-`usr.shunt` also installs graphify from nixpkgs and its Claude skill from the
+The NixOS module also installs graphify from nixpkgs and its Claude skill from the
 package (`skill.md` plus `skills/claude/references`), in place of
 `graphify install`, and ignores `graphify-out/` globally in git. Two details
 found by measuring:
@@ -206,3 +266,8 @@ found by measuring:
 - **`.glsl` is not indexed** — GLSL shaders are invisible to the graph and need
   reading. `.swift`, `.metal`, `.m` and `.mm` are (the last three through the C
   parser).
+
+## License
+
+Apache License 2.0, the license of upstream shunt: see `LICENSE`, and `NOTICE`
+for what this repository took from it.

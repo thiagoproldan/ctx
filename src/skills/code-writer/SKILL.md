@@ -5,10 +5,10 @@ description: Delegates boilerplate generation to a cheap non-Claude model (Gemin
 
 ```bash
 # Generate and write straight to the target file
-shunt-code-write --spec "<what to generate>" --reference <model-file> --target <destination>
+ctx-code-write --spec "<what to generate>" --reference <model-file> --target <destination>
 
 # Or print to stdout (omit --target)
-shunt-code-write --spec "<what to generate>" --reference <model-file>
+ctx-code-write --spec "<what to generate>" --reference <model-file>
 ```
 
 With `--target`, the generated code goes to disk without passing through your
@@ -22,4 +22,4 @@ the next call's `--reference`.
 After generating: review it and make the surgical edits for the ~5–20% that need
 judgement. And **run the tests** — nobody has verified the worker's output.
 
-Variables: `SHUNT_MODEL` (default `gemini-3.8-flash-medium`), `SHUNT_TIMEOUT_SECONDS` (300).
+Variables: `CTX_MODEL` (default `gemini-3.8-flash-medium`), `CTX_TIMEOUT_SECONDS` (300).

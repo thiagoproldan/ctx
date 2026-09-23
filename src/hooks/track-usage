@@ -6,7 +6,7 @@
 # actually matters. Measured: ~1ms when discarding, ~20ms when recording (and by
 # then a real command has already run).
 
-[ "${SHUNT_DISABLE:-0}" = "1" ] && exit 0
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
 
 input=$(cat)
 
@@ -26,13 +26,13 @@ case "$tool" in
     cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
     case "$cmd" in
       *graphify\ query*|*graphify\ explain*|*graphify\ path*)
-        shunt_log graph "$sid" cmd "${cmd:0:200}" ;;
+        ctx_log graph "$sid" cmd "${cmd:0:200}" ;;
       *bulk-read*)
         # bulk-read's --paths is what ties this line to the block.
         p=$(printf '%s' "$cmd" | sed -nE 's/.*--paths[[:space:]]+([^[:space:]]+).*/\1/p')
-        shunt_log bulk "$sid" path "$p" ;;
+        ctx_log bulk "$sid" path "$p" ;;
       *code-write*)
-        shunt_log write "$sid" cmd "${cmd:0:200}" ;;
+        ctx_log write "$sid" cmd "${cmd:0:200}" ;;
     esac
     ;;
   Read)
@@ -45,7 +45,7 @@ case "$tool" in
     path=$(printf '%s' "$input" | jq -r '
       if (.tool_input.offset != null or .tool_input.limit != null)
       then (.tool_input.file_path // empty) else empty end' 2>/dev/null)
-    [ -n "$path" ] && shunt_log reread "$sid" path "$path"
+    [ -n "$path" ] && ctx_log reread "$sid" path "$path"
     ;;
 esac
 exit 0

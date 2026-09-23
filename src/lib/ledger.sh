@@ -9,11 +9,11 @@
 # targeted re-read, a delegation, or nothing". "Nothing" is the one number that
 # exposes a hook being ignored, and no usage counter on its own can see it.
 
-SHUNT_STATE="${SHUNT_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/shunt}"
-SHUNT_FUNNEL="${SHUNT_FUNNEL:-$SHUNT_STATE/funnel.jsonl}"
+CTX_STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+CTX_FUNNEL="${CTX_FUNNEL:-$CTX_STATE/funnel.jsonl}"
 
-# shunt_log <ev> <sid> [key value]...
-shunt_log() {
+# ctx_log <ev> <sid> [key value]...
+ctx_log() {
   local ev="$1" sid="$2"
   shift 2
   local args=(-c -n --arg ev "$ev" --arg sid "$sid")
@@ -26,6 +26,6 @@ shunt_log() {
   filter="$filter}"
   # A failed write must never take a hook down: the worst case is a lost
   # measurement, not a stuck session.
-  mkdir -p "$(dirname "$SHUNT_FUNNEL")" 2>/dev/null
-  jq "${args[@]}" "$filter" >>"$SHUNT_FUNNEL" 2>/dev/null || true
+  mkdir -p "$(dirname "$CTX_FUNNEL")" 2>/dev/null
+  jq "${args[@]}" "$filter" >>"$CTX_FUNNEL" 2>/dev/null || true
 }

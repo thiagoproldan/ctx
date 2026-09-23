@@ -13,15 +13,15 @@
 # The third exists because (2) only sees what was delegated. "98% saved" over
 # ten delegations says nothing about a week where 90% of the context came from
 # small Bash outputs no hook can catch. Measuring the sessions is what tells you
-# whether the shunt matters for how you work, and --since/--until let you
+# whether the delegation matters for how you work, and --since/--until let you
 # compare a week before a change with a week after it.
 #
-# Usage: shunt-report [--since YYYY-MM-DD] [--until YYYY-MM-DD]
+# Usage: ctx-report [--since YYYY-MM-DD] [--until YYYY-MM-DD]
 set -u
-SHUNT_STATE="${SHUNT_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/shunt}"
-FUNNEL="${SHUNT_FUNNEL:-$SHUNT_STATE/funnel.jsonl}"
-LEDGER="${SHUNT_LEDGER:-$SHUNT_STATE/usage.jsonl}"
-MIN_LINES="${SHUNT_MIN_LINES:-350}"
+CTX_STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+FUNNEL="${CTX_FUNNEL:-$CTX_STATE/funnel.jsonl}"
+LEDGER="${CTX_LEDGER:-$CTX_STATE/usage.jsonl}"
+MIN_LINES="${CTX_MIN_LINES:-350}"
 
 since=$(date -d '7 days ago' +%F)
 until=$(date -d tomorrow +%F)
@@ -36,7 +36,7 @@ while [ $# -gt 0 ]; do
     shift 2
     ;;
   *)
-    echo "usage: shunt-report [--since YYYY-MM-DD] [--until YYYY-MM-DD]" >&2
+    echo "usage: ctx-report [--since YYYY-MM-DD] [--until YYYY-MM-DD]" >&2
     exit 1
     ;;
   esac

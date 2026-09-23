@@ -523,11 +523,11 @@ def eval_cmd(cmd, ctx, stdin):
 
 def state_dir():
     base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.environ.get("HOME", "/tmp"), ".local/state")
-    return os.environ.get("SHUNT_STATE") or os.path.join(base, "shunt")
+    return os.environ.get("CTX_STATE") or os.path.join(base, "ctx")
 
 
 def log_block(sid, path, lines):
-    funnel = os.environ.get("SHUNT_FUNNEL") or os.path.join(state_dir(), "funnel.jsonl")
+    funnel = os.environ.get("CTX_FUNNEL") or os.path.join(state_dir(), "funnel.jsonl")
     try:
         os.makedirs(os.path.dirname(funnel), exist_ok=True)
         with open(funnel, "a") as f:
@@ -551,9 +551,9 @@ def graphify_hint(path):
 
 
 def main():
-    if os.environ.get("SHUNT_DISABLE") == "1":
+    if os.environ.get("CTX_DISABLE") == "1":
         allow()
-    raw = os.environ.get("SHUNT_MIN_LINES", "")
+    raw = os.environ.get("CTX_MIN_LINES", "")
     min_lines = int(raw) if raw.isdigit() else MIN_LINES_DEFAULT
 
     data = json.load(sys.stdin)
@@ -590,7 +590,7 @@ def main():
         f"{listing}"
         f"{graphify_hint(top) if top else ''}\n\n"
         f"To ingest the content anyway, delegate instead:\n"
-        f"  shunt-bulk-read --question \"<question>\" --paths {paths}\n"
+        f"  ctx-bulk-read --question \"<question>\" --paths {paths}\n"
         f"For a specific slice, use grep, sed -n 'A,Bp' or head/tail with N under {min_lines}, "
         f"or send the output to a file and grep that."
     )

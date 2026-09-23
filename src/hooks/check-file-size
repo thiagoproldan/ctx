@@ -10,12 +10,12 @@ deny() {
 }
 allow() { exit 0; }   # nothing on stdout => normal permission flow
 
-[ "${SHUNT_DISABLE:-0}" = "1" ] && allow
+[ "${CTX_DISABLE:-0}" = "1" ] && allow
 
 # 350 is the article's default. The first port used 2000, which made this hook
 # nearly dead code: Claude Code's Read already stops at 2000 lines by itself,
 # so every 350–2000 line file — where the saving is — went straight in.
-MIN_LINES="${SHUNT_MIN_LINES:-350}"
+MIN_LINES="${CTX_MIN_LINES:-350}"
 case "$MIN_LINES" in ''|*[!0-9]*) MIN_LINES=350 ;; esac
 
 input=$(cat)
@@ -41,11 +41,11 @@ lines=$(wc -l < "$file_path" 2>/dev/null | tr -d ' ' || echo 0)
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib"
 . "$LIB/graphify.sh"
 . "$LIB/ledger.sh"
-shunt_log block "$(printf '%s' "$input" | jq -r '.session_id // "?"')" \
+ctx_log block "$(printf '%s' "$input" | jq -r '.session_id // "?"')" \
   path "$file_path" lines "$lines" tool Read
 
 deny "File has ${lines} lines (threshold: ${MIN_LINES}).$(graphify_hint "$file_path")
 
 To ingest the content anyway, delegate instead of reading it directly:
-  shunt-bulk-read --question \"<question>\" --paths ${file_path}
+  ctx-bulk-read --question \"<question>\" --paths ${file_path}
 If you are going to edit, re-read only the slice you need with offset/limit."
