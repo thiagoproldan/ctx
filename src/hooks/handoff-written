@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# PostToolUse on ekko's create and batch: note the context at which this
+# session wrote a handoff, so that the status line can say how old it is and
+# the Stop hook can tell a fresh handoff from a stale one.
+#
+# A handoff goes stale as the session goes on: the first live ask came at 330k
+# on 2026-09-23, and a user who keeps working after it would /clear later from
+# a handoff that no longer says where the session stopped, which the next
+# session is told to act on at once. Asking again every so often would hold a
+# turn each time, in exactly the long sessions that matter; showing the age
+# costs nothing and leaves the moment to the user (/handoff).
+#
+# The age is measured in context, not minutes: it is the work the handoff has
+# not seen. Only a write ekko accepted counts -- a refused one comes back as
+# 'CODE: message', not {"ok":true} -- whether it came from the Stop hook's ask,
+# from /handoff, or from a plain request.
+set -u
+
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
+
+input=$(cat)
+
+# Cheap triage: every ekko create and batch comes here, and only one that
+# names the handoff kind matters.
+case "$input" in *handoff*) ;; *) exit 0 ;; esac
+
+STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/handoff.sh
+. "$ROOT/lib/handoff.sh"
+
+sid="" transcript="" wrote=false
+eval "$(printf '%s' "$input" | jq -r '
+  def ops: .tool_input.ops // [] | if type == "string" then (fromjson? // []) else . end;
+  ((.tool_name // "") | tostring | test("ekko")) as $ekko
+  | (.tool_input.kind == "handoff"
+     or ([ops | arrays | .[] | objects | select(.op == "create" and .kind == "handoff")] | length > 0)) as $handoff
+  | ([.tool_response | .. | strings] | join(" ") | test("\"ok\"\\s*:\\s*true")) as $ok
+  | @sh "sid=\(.session_id // "" | tostring) transcript=\(.transcript_path // "" | tostring) wrote=\($ekko and $handoff and $ok)"
+' 2>/dev/null)" 2>/dev/null
+
+# The session id names a file: nothing that could leave the directory.
+case "$sid" in '' | */* | .*) exit 0 ;; esac
+[ "$wrote" = "true" ] || exit 0
+
+tokens=$(ctx_context_tokens "$transcript")
+[ "$tokens" -gt 0 ] || exit 0
+# A failed write must never take the hook down: the worst case is an age the
+# status line does not show.
+mkdir -p "$STATE/handoff" 2>/dev/null
+printf '%s\n' "$tokens" >"$STATE/handoff/$sid.written" 2>/dev/null || true
+exit 0

@@ -426,6 +426,14 @@ is "260k: asks" ask "$out"
 has "names the context and the threshold" present "260k tokens, past the 250k" "$out"
 has "asks for the ekko handoff" present "write a handoff (kind handoff)" "$out"
 has "tells the user about /clear" present "/clear" "$out"
+has "asks for typed notes first" present "decision, gotcha or procedure" "$out"
+has "asks for the notes to read, by id" present "by id" "$out"
+# One text for the Stop hook and /handoff: the skill's body, read here without
+# the hook's code, must be in the ask as it is.
+skill="$ROOT/skills/handoff/SKILL.md"
+has "the ask is /handoff's own text" present "$(sed '/^---$/,/^---$/d' "$skill" | sed '/./,$!d')" \
+  "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext' 2>/dev/null)"
+has "/handoff is the user's alone" present "disable-model-invocation: true" "$(cat "$skill" 2>/dev/null)"
 has "a subagent's 900k is not the context" absent "900k" "$out"
 is "same band again (300k): quiet" quiet "$(stop a 300000)"
 is "next band (510k): asks again" ask "$(stop a 510000)"
@@ -475,6 +483,88 @@ touch -d '20 minutes ago' "$CTX_STATE/sessions/g"
 is "a 20-minute-old 5h reading is ignored" quiet "$(stop g 50000)"
 sl5 h 90
 has "both triggers in one ask" present ", and the 5-hour" "$(stop h 300000)"
+
+# --- handoff written (PostToolUse) and its age ------------------------------------
+# Each handoff ekko accepts leaves the context it was written at, and nothing
+# else may: a mark left by a note or a refused write would make the status
+# line call a stale handoff fresh, and the Stop hook skip an ask it owes.
+echo "handoff written (PostToolUse):"
+HW="$HOOKS/handoff-written"
+# posted <session> <tokens> <tool> <tool_input json> <reply text> -- the hook's
+# output, which is always empty
+posted() {
+  transcript "$TMP/tr-w-$1.jsonl" "$2"
+  jq -nc --arg s "$1" --arg t "$TMP/tr-w-$1.jsonl" --arg n "$3" --argjson i "$4" --arg r "$5" '
+    {session_id: $s, transcript_path: $t, hook_event_name: "PostToolUse",
+     tool_name: $n, tool_input: $i, tool_response: [{type: "text", text: $r}]}' |
+    env -u CTX_DISABLE "$HW" 2>&1
+}
+written() { cat "$CTX_STATE/handoff/$1.written" 2>/dev/null; }
+OK='{"ok":true,"items":[{"id":415}]}'
+EC=mcp__plugin_ekko_ekko__create
+EB=mcp__plugin_ekko_ekko__batch
+out=$(posted w1 332000 $EC '{"kind":"handoff","attached_to":337,"text":"WHERE IT STOPPED"}' "$OK")
+has "a handoff ekko accepted is noted" present "332000" "$(written w1)"
+has "...and the hook prints nothing" present "[]" "[$out]"
+posted w2 332000 $EC '{"kind":"note","attached_to":337,"text":"about the handoff"}' "$OK" >/dev/null
+has "a note that mentions one is not" absent "332000" "$(written w2)"
+posted w3 332000 $EC '{"kind":"handoff","attached_to":337,"text":"h"}' "ATTACH_NOT_TASK: 337 is a note" >/dev/null
+has "a refused handoff is not" absent "332000" "$(written w3)"
+posted w4 332000 $EB '{"ops":[{"op":"create","kind":"decision","text":"d"},{"op":"create","kind":"handoff","attached_to":337,"text":"h"}]}' '{"ok":true,"results":[]}' >/dev/null
+has "a handoff inside a batch is noted" present "332000" "$(written w4)"
+posted w5 332000 $EB '{"ops":[{"op":"create","kind":"note","text":"the handoff was fine"}]}' '{"ok":true,"results":[]}' >/dev/null
+has "a batch without one is not" absent "332000" "$(written w5)"
+posted w6 332000 mcp__other__create '{"kind":"handoff","text":"h"}' "$OK" >/dev/null
+has "another server's create is not ekko's" absent "332000" "$(written w6)"
+posted w1 350000 $EC '{"kind":"handoff","attached_to":337,"text":"again"}' "$OK" >/dev/null
+has "a later handoff moves the mark" present "350000" "$(written w1)"
+jq -nc --arg t "$TMP/tr-w-w1.jsonl" --arg n "$EC" --arg r "$OK" '
+  {session_id: "../w7", transcript_path: $t, tool_name: $n,
+   tool_input: {kind: "handoff"}, tool_response: [{type: "text", text: $r}]}' |
+  env -u CTX_DISABLE "$HW" >/dev/null 2>&1
+has "session id with a slash: nothing written" absent "w7" "$(ls "$CTX_STATE" "$CTX_STATE/handoff")"
+out=$(
+  printf 'not json, but handoff' | env -u CTX_DISABLE "$HW"
+  echo "rc=$?"
+)
+has "malformed input: exit 0" present "rc=0" "$out"
+
+# A fresh handoff holds the session: the Stop hook stays quiet and the band
+# counts as asked. A stale one, or one from before a compaction, does not.
+mkdir -p "$CTX_STATE/handoff"
+printf '245000\n' >"$CTX_STATE/handoff/k.written"
+is "handoff at 245k, stop at 260k: quiet" quiet "$(stop k 260000)"
+is "...at 300k, stale but asked: quiet" quiet "$(stop k 300000)"
+has "a fresh handoff is logged" present '"ev":"handoff-fresh"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
+printf '100000\n' >"$CTX_STATE/handoff/m.written"
+is "handoff at 100k, stop at 260k: asks" ask "$(stop m 260000)"
+printf '400000\n' >"$CTX_STATE/handoff/n.written"
+is "handoff from before a compaction: asks" ask "$(stop n 260000)"
+sl5 q 90
+printf '45000\n' >"$CTX_STATE/handoff/q.written"
+is "5h at 90% with a fresh handoff: quiet" quiet "$(stop q 50000)"
+
+# The status line gives the handoff's age in context: fresh under a tenth of
+# the threshold, stale past it.
+# sls <session> <context tokens>
+sls() {
+  jq -nc --arg s "$1" --argjson t "$2" '
+    {session_id: $s, model: {display_name: "Opus 5"},
+     context_window: {total_input_tokens: $t}}' | env NO_COLOR=1 "$SL"
+}
+printf '330000\n' >"$CTX_STATE/handoff/v.written"
+has "fresh handoff: ✓ and its age" present "ctx 335k ✓ handoff 5k ago" "$(sls v 335000)"
+has "stale handoff: ⚑ and its age" present "ctx 410k ⚑ handoff 80k ago" "$(sls v 410000)"
+printf '100000\n' >"$CTX_STATE/handoff/u.written"
+has "under the threshold, stale: the age" present "ctx 180k · handoff 80k ago" "$(sls u 180000)"
+has "under the threshold, fresh: ✓" present "ctx 102k ✓ handoff 2k ago" "$(sls u 102000)"
+has "after a compaction: no age" absent "ago" "$(sls v 60000)"
+has "no handoff written: no age" absent "ago" "$(sls nobody 300000)"
+has "...and the flag as before" present "ctx 300k ⚑ handoff" "$(sls nobody 300000)"
+has "fresh keeps the size colour" present "${ESC}[33mctx 335k ✓" \
+  "$(jq -nc '{session_id: "v", context_window: {total_input_tokens: 335000}}' | env -u NO_COLOR "$SL")"
+has "session id with a slash: no age" absent "ago" \
+  "$(jq -nc '{session_id: "../v", context_window: {total_input_tokens: 335000}}' | env NO_COLOR=1 "$SL")"
 
 # --- live: the worker ---------------------------------------------------------------
 # Not hermetic (needs the worker signed in via ctx-login, and the network), so

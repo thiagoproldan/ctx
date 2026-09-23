@@ -1,7 +1,7 @@
 {
   "name": "ctx",
   "version": "@version@",
-  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends.",
+  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends, then shows how old it is.",
   "homepage": "https://github.com/thiagoproldan/ctx",
   "hooks": {
     "PreToolUse": [
@@ -22,6 +22,12 @@
       {
         "matcher": "Bash|Read",
         "hooks": [{ "type": "command", "command": "@root@/hooks/track-usage" }]
+      },
+      {
+        "matcher": "mcp__.*ekko.*__(create|batch)",
+        "hooks": [
+          { "type": "command", "command": "@root@/hooks/handoff-written" }
+        ]
       }
     ],
     "SessionStart": [

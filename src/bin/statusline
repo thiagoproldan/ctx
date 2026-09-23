@@ -16,6 +16,13 @@
 # (hooks/handoff) finds it: the hook's input carries no rate limits, and the
 # status line is the only place Claude Code hands them out.
 #
+# Once this session has written a handoff (hooks/handoff-written notes the
+# context it was written at), the context segment says how old it is:
+# "✓ handoff 5k ago" while it is fresh -- less than a tenth of
+# CTX_HANDOFF_TOKENS since, so a /clear loses nothing -- and "⚑ handoff 80k
+# ago" once the session has gone on past it, so the /clear waits for a fresh
+# one (/handoff).
+#
 # Thresholds (environment), shared with hooks/handoff:
 #   CTX_HANDOFF_TOKENS  context that warrants a handoff   (default 250000;
 #                       a replay of 30 days of sessions: ~90% of what 200k
@@ -34,7 +41,22 @@ cols=$(int_or "${COLUMNS:-}" 120)
 color=1
 [ -n "${NO_COLOR:-}" ] && color=0
 
-readings="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}/sessions"
+state="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+readings="$state/sessions"
+
+# The payload is read once, with builtins. The session id is picked out of it
+# before jq runs, because it names the file holding the context at which this
+# session last wrote a handoff.
+IFS= read -r -d '' payload || true
+written=""
+if [[ $payload =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"/]+)\" ]]; then
+  case "${BASH_REMATCH[1]}" in
+    .*) ;;
+    *) [ -r "$state/handoff/${BASH_REMATCH[1]}.written" ] &&
+      IFS= read -r written <"$state/handoff/${BASH_REMATCH[1]}.written" ;;
+  esac
+fi
+case "$written" in '' | *[!0-9]*) written=null ;; esac
 
 # One jq process: the status line runs after every assistant message and on a
 # timer, so it must stay cheap. Its first two lines are the reading for the
@@ -45,7 +67,7 @@ readings="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}/sessions"
   IFS= read -r five || five=""
   IFS= read -r line || line=""
 } < <(jq -r \
-  --argjson ht "$handoff_tokens" --argjson h5 "$handoff_5h" \
+  --argjson ht "$handoff_tokens" --argjson h5 "$handoff_5h" --argjson hw "$written" \
   --argjson cw "$cache_warn" --argjson cols "$cols" --argjson color "$color" '
   def paint($code; $s): if $color == 1 then "[\($code)m\($s)[0m" else $s end;
   def k: if . >= 1000000 then "\(. / 100000 | floor | . / 10)M"
@@ -56,10 +78,17 @@ readings="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}/sessions"
       ([.model.display_name, .effort.level] | map(select(. != null)) | join(" ")),
 
       (.context_window.total_input_tokens as $t
-       | if $t == null then empty
-         elif $ht > 0 and $t >= 2 * $ht then paint("31"; "ctx \($t | k) ⚑ handoff")
-         elif $ht > 0 and $t >= $ht then paint("33"; "ctx \($t | k) ⚑ handoff")
-         else paint("32"; "ctx \($t | k)") end),
+       | if $t == null then empty else
+           # A handoff above the context now predates a compaction: its age
+           # is unknown, so it is not shown.
+           (if $hw != null and $t >= $hw then $t - $hw else null end) as $age
+           | (if $ht > 0 and $t >= 2 * $ht then "31" elif $ht > 0 and $t >= $ht then "33" else "32" end) as $c
+           | (if $age != null and $age < $ht / 10 then " ✓ handoff \($age | k) ago"
+              elif $ht > 0 and $t >= $ht then " ⚑ handoff\(if $age != null then " \($age | k) ago" else "" end)"
+              elif $age != null then " · handoff \($age | k) ago"
+              else "" end) as $flag
+           | paint($c; "ctx \($t | k)\($flag)")
+         end),
 
       (.rate_limits.five_hour as $f
        | if $f == null or $f.used_percentage == null then empty else
@@ -91,7 +120,7 @@ readings="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}/sessions"
   | (.session_id // "" | tostring),
     (.rate_limits.five_hour.used_percentage | if type == "number" then floor | tostring else "" end),
     $line
-' 2>/dev/null)
+' <<<"$payload" 2>/dev/null)
 
 # The session id names a file: nothing that could leave the directory.
 case "$sid" in

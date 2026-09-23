@@ -18,6 +18,12 @@
 # scheduled wakeup would resume the session -- a /clear then would drop it --
 # in which case it asks at the next stop instead.
 #
+# Nor when a handoff this session wrote is still fresh: less than a tenth of
+# the threshold of context since (hooks/handoff-written notes each one). The
+# user who ran /handoff at 240k does not want a second one at 250k; the band
+# counts as asked. The ask itself is the body of skills/handoff/SKILL.md, the
+# text /handoff sends, so the two never drift apart.
+#
 # The context is the last main-thread call's input, read from the end of the
 # transcript (input + cache writes + cache reads); the 5-hour reading is the
 # one the status line left for this session, when it is recent.
@@ -29,6 +35,9 @@ int_or() { case "${1:-}" in '' | *[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
 threshold=$(int_or "${CTX_HANDOFF_TOKENS:-}" 250000)
 limit_5h=$(int_or "${CTX_HANDOFF_5H:-}" 85)
 STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/handoff.sh
+. "$ROOT/lib/handoff.sh"
 
 input=$(cat)
 sid="" transcript="" active=false pending=0
@@ -41,20 +50,7 @@ case "$sid" in '' | */* | .*) exit 0 ;; esac
 [ "$active" = "true" ] && exit 0
 pending=$(int_or "$pending" 0)
 
-tokens=0
-if [ -n "$transcript" ] && [ -r "$transcript" ]; then
-  # From the end, the first main-thread reply that carries usage. A line still
-  # being written, or any other line that is not JSON, is skipped.
-  tokens=$(tac -- "$transcript" 2>/dev/null | jq -nR '
-    first(inputs | fromjson? | objects
-          | select(.type == "assistant" and (.isSidechain | not)
-                   and (.message.usage | type) == "object")
-          | .message.usage
-          | (.input_tokens // 0) + (.cache_creation_input_tokens // 0)
-            + (.cache_read_input_tokens // 0)) // 0
-  ' 2>/dev/null)
-fi
-tokens=$(int_or "$tokens" 0)
+tokens=$(ctx_context_tokens "$transcript")
 
 five=""
 reading="$STATE/sessions/$sid"
@@ -104,6 +100,19 @@ record "$last_band" "$last_hot"
 # Readings and books of sessions long gone.
 find "$STATE/sessions" "$STATE/handoff" -type f -mtime +7 -delete 2>/dev/null
 
+# shellcheck source=../lib/ledger.sh
+. "$ROOT/lib/ledger.sh"
+
+# A handoff written moments ago already holds the session: the band counts as
+# asked, and the status line shows how fresh the handoff is.
+written=$(ctx_handoff_written "$STATE" "$sid")
+if [ -n "$written" ] && [ "$tokens" -ge "$written" ] &&
+  [ $((tokens - written)) -lt $((threshold / 10)) ]; then
+  CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff-fresh "$sid" \
+    tokens "$tokens" written "$written" band "$band"
+  exit 0
+fi
+
 k() { echo "$(($1 / 1000))k"; }
 why=""
 [ "$ask_tokens" -eq 1 ] &&
@@ -111,15 +120,9 @@ why=""
 [ "$ask_5h" -eq 1 ] &&
   why="${why:+$why, and }the 5-hour usage window is at ${five}%, past ${limit_5h}%"
 
-LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib"
-# shellcheck source=../lib/ledger.sh
-. "$LIB/ledger.sh"
 CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff "$sid" \
   tokens "$tokens" five "$five" band "$band"
 
-jq -n --arg m "ctx: $why. Hand off before you stop:
-- If this folder has an ekko board, write a handoff (kind handoff) on the task in progress: where you stopped, what was decided and why, the files, and the next step as an action the next session takes at once, without exploring first.
-- Then end with one line telling the user the handoff is written and that /clear starts a fresh session from it.
-- With no board, tell the user in one line why and that /clear starts fresh.
+jq -n --arg m "ctx: $why. $(ctx_handoff_text "$ROOT")
 Start no new work in this turn." \
   '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: $m}}'

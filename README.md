@@ -38,11 +38,16 @@ plugin, the same way ekko is.
      block, for the funnel.
    - `handoff` — `Stop`: past `CTX_HANDOFF_TOKENS` of context (250k), or the
      5-hour window past `CTX_HANDOFF_5H` (85%), keeps the turn open once and
-     asks for the ekko handoff and a `/clear`.
+     asks for the ekko handoff and a `/clear` — unless a handoff the session
+     wrote moments before already holds it.
+   - `handoff-written` — `PostToolUse` on ekko's `create` and `batch`: notes the
+     context at which the session wrote a handoff, so its age can be shown.
 2. **Scripts** — `ctx-bulk-read` and `ctx-code-write` do the delegation;
    `ctx-report` and `ctx-test` measure and verify; `ctx-statusline` draws the
    status line.
 3. **Skills** — `bulk-reader` and `code-writer` say when and how to call them.
+   `handoff` is the user's alone (`/handoff`): the Stop hook's ask, at a moment
+   the user picks.
 
 ## The handoff
 
@@ -64,9 +69,11 @@ At the end of each turn, the `handoff` hook:
   call's input, cache writes and cache reads. A subagent's replies do not
   count, and neither does a line still being written;
 - past the threshold, keeps the turn open once — as `additionalContext`, which
-  Claude Code shows as _Stop hook feedback_, not as an error — asking for the
-  handoff on the task in progress: where it stopped, what was decided and why,
-  the files, and the next step as an action the next session takes at once,
+  Claude Code shows as _Stop hook feedback_, not as an error — asking first for
+  typed ekko notes (decision, gotcha, procedure) for whatever later sessions
+  must keep, then for the handoff on the task in progress: where it stopped,
+  what was decided and why, the files, the notes the next session must read in
+  full, by id, and the next step as an action the next session takes at once,
   without exploring first. Then one line telling the user to `/clear`;
 - asks once per band: at T, again at 2T, 3T…; a compaction re-arms the bands
   it came back under;
@@ -77,7 +84,23 @@ At the end of each turn, the `handoff` hook:
 - stays quiet while a stop hook is already continuing the turn, and while
   background work or a scheduled wakeup would resume the session — a `/clear`
   then would drop it. It asks at the next stop instead;
-- logs each ask to `$CTX_STATE/handoff.jsonl`.
+- stays quiet, and counts the band as asked, while a handoff this session wrote
+  is fresh: less than a tenth of the threshold of context since it;
+- logs each ask, and each one a fresh handoff spared, to
+  `$CTX_STATE/handoff.jsonl`.
+
+The ask is the body of `skills/handoff/SKILL.md`, which is also what `/handoff`
+sends: one text, so the hook and the command cannot drift apart.
+
+A handoff goes stale as the session goes on. The first live ask came at 330k
+on 2026-09-23; a user who keeps working after it, because the session matters,
+would `/clear` later from a handoff that no longer says where the session
+stopped — and the next session is told to act on it at once. Asking again
+every so often would hold a turn each time, in exactly those sessions. So the
+`handoff-written` hook notes the context each accepted handoff was written at
+(`$CTX_STATE/handoff/<session>.written`), and the status line shows the age:
+`✓ handoff 5k ago` while it is fresh, `⚑ handoff 80k ago` once the session has
+gone on, which is the cue to run `/handoff` before the `/clear`.
 
 In a folder without an ekko board, the ask only tells the user. ekko needs
 nothing new for this: the handoff is an ekko note of kind `handoff`, which the
@@ -211,6 +234,8 @@ invalidated or cold (10%), and the output. So it shows:
 | -------------------------------------------------------- | --------------------------------------------------------------------- |
 | `Opus 5 max`                                             | model and effort — changing either mid-session invalidates the cache  |
 | `ctx 212k ⚑ handoff`                                     | context tokens; yellow from `CTX_HANDOFF_TOKENS`, red at twice that |
+| `ctx 335k ✓ handoff 5k ago`                              | a handoff this session wrote, fresh: a `/clear` loses nothing         |
+| `ctx 410k ⚑ handoff 80k ago`                             | the session went on past it: `/handoff` again before the `/clear`     |
 | `5h 87% ↺14:30 ⚑ handoff`                                | 5-hour window and its reset; handoff from `CTX_HANDOFF_5H`          |
 | `7d 41%`                                                 | 7-day window, on terminals at least 100 columns wide                  |
 | `cache ● 38m` / `cache ○ cold, next call re-caches 612k` | minutes until the cache goes cold, or what the next call will rewrite |
