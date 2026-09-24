@@ -42,6 +42,10 @@ plugin, the same way ekko is.
      wrote moments before already holds it.
    - `handoff-written` — `PostToolUse` on ekko's `create` and `batch`: notes the
      context at which the session wrote a handoff, so its age can be shown.
+   - `cold-return` — `UserPromptSubmit`: a prompt that comes back to a context
+     of `CTX_COLD_TOKENS` (250k) after `CTX_COLD_MINUTES` (60) idle, when the
+     prompt cache has expired, is stopped once with what going on and starting
+     over would cost and how old the handoff is; sent again, it goes through.
 2. **Scripts** — `ctx-bulk-read` and `ctx-code-write` do the delegation;
    `ctx-report` and `ctx-test` measure and verify; `ctx-statusline` draws the
    status line.
@@ -101,6 +105,45 @@ every so often would hold a turn each time, in exactly those sessions. So the
 (`$CTX_STATE/handoff/<session>.written`), and the status line shows the age:
 `✓ handoff 5k ago` while it is fresh, `⚑ handoff 80k ago` once the session has
 gone on, which is the cue to run `/handoff` before the `/clear`.
+
+### Coming back to a cold cache
+
+Claude Code keeps the context cached for an hour. After a longer pause, the
+next call writes all of it back to the cache, at twice the input price, before
+any work: in the 30 days to 2026-09-24 that happened 65 times, 7.5% of the
+bill, at a median context of 525k, and 58 of them came with the user's next
+prompt. One of 530k cost 7 points of the 5-hour window on 2026-09-23 (about
+175k units a point, input being 1). Starting over costs too: the new session
+writes its ~45k prefix and spends ~331k units finding its way (the mean over
+those 30 days), ~2 points in all. Under ~210k of context, going on is the
+cheaper of the two.
+
+So the `cold-return` hook reads when the last main-thread call was made (the
+transcript's timestamp; a message Claude Code wrote itself, such as an API
+error, made no call) and stops, once, a prompt that arrives `CTX_COLD_MINUTES`
+(60) or more after it on a context of `CTX_COLD_TOKENS` (250k, the Stop hook's
+threshold) or more. No call is made; Claude Code shows the reason, with both
+prices, and the prompt under it:
+
+```text
+ctx: idle 1h12m, and the prompt cache has expired: this prompt would first write all 344k tokens of context back to the cache, at twice the input price.
+Going on here costs ~4 points of the 5-hour window before any work; starting over, ~2 points (the new session's prime and first reads).
+The handoff written 4k tokens ago holds this session: /clear starts the next one from it.
+Sent again, the prompt goes through.
+```
+
+With a stale handoff, or none, the second line says so, and that `/handoff`
+first costs this same rewrite. Each stop is keyed to the last call it followed
+(`$CTX_STATE/cold/<session>`), so the prompt sent again goes through and the
+next pause after more work can stop again. A slash command always goes
+through, and so does any prompt while background work or a scheduled wakeup
+would resume the session: the hook's input does not say who sent the prompt,
+and one a cron or a `/loop` sent has nobody to send it again. The Stop hook,
+whose input lists them, keeps the mark (`$CTX_STATE/cold/<session>.scheduled`).
+Each stop, each prompt sent again after one, and each let through for a
+schedule is logged to `$CTX_STATE/handoff.jsonl` (`cold-stop`, `cold-pass`,
+`cold-scheduled`): how often a stop ends in a `/clear` is the count that says
+whether the hook pays.
 
 In a folder without an ekko board, the ask only tells the user. ekko needs
 nothing new for this: the handoff is an ekko note of kind `handoff`, which the
@@ -263,6 +306,8 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
 | `CTX_HANDOFF_5H`        | `85`                      | Status line and Stop hook: 5-hour percentage for a handoff         |
 | `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
+| `CTX_COLD_TOKENS`       | `250000`                  | Cold-return hook: context worth stopping a prompt for (0 off)      |
+| `CTX_COLD_MINUTES`      | `60`                      | Cold-return hook: idle minutes that make the cache cold (0 off)    |
 
 ## Moving from shunt
 

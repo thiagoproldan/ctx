@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# What the handoff hooks share: the context a session is at, the one text that
-# asks for a handoff, and where a written handoff is noted.
+# What the handoff hooks share: the context a session is at and when it last
+# called, the one text that asks for a handoff, and where a written handoff is
+# noted.
 #
 # The Stop hook (hooks/handoff) asks past the threshold, the user asks through
-# /handoff (skills/handoff), and hooks/handoff-written notes each handoff ekko
-# writes, so that the status line can say how old it is.
+# /handoff (skills/handoff), hooks/handoff-written notes each handoff ekko
+# writes, so that the status line can say how old it is, and hooks/cold-return
+# points at it when a prompt would re-write an expired cache.
 
 # ctx_context_tokens <transcript> -- the last main-thread call's input (input +
 # cache writes + cache reads), read from the end of the transcript; 0 without
@@ -24,6 +26,31 @@ ctx_context_tokens() {
   fi
   case "$tokens" in '' | *[!0-9]*) tokens=0 ;; esac
   echo "$tokens"
+}
+
+# ctx_last_call <transcript> -- "<tokens> <epoch>": the last main-thread call's
+# context, counted as ctx_context_tokens counts it, and when it was made, in
+# seconds; "0 0" without one. A message Claude Code wrote itself (model
+# <synthetic>: an API error, an interrupted turn) made no call and is passed
+# over, like a subagent's reply.
+ctx_last_call() {
+  local transcript="${1:-}" out=""
+  if [ -n "$transcript" ] && [ -r "$transcript" ]; then
+    out=$(tac -- "$transcript" 2>/dev/null | jq -nrR '
+      first(inputs | fromjson? | objects
+            | select(.type == "assistant" and (.isSidechain | not)
+                     and (.message.usage | type) == "object"
+                     and .message.model != "<synthetic>")
+            | [(.message.usage
+                | (.input_tokens // 0) + (.cache_creation_input_tokens // 0)
+                  + (.cache_read_input_tokens // 0)),
+               (.timestamp // "" | tostring | sub("\\.[0-9]+"; "")
+                | try fromdateiso8601 catch 0)]
+            | map(floor | tostring) | join(" ")) // "0 0"
+    ' 2>/dev/null)
+  fi
+  [[ "$out" =~ ^[0-9]+\ [0-9]+$ ]] || out="0 0"
+  echo "$out"
 }
 
 # ctx_handoff_text <root> -- the ask, without the reason for it: the body of

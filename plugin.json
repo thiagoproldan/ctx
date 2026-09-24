@@ -1,7 +1,7 @@
 {
   "name": "ctx",
   "version": "@version@",
-  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends, then shows how old it is.",
+  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends, then shows how old it is, and stops once a prompt that would re-write a big expired cache.",
   "homepage": "https://github.com/thiagoproldan/ctx",
   "hooks": {
     "PreToolUse": [
@@ -34,6 +34,13 @@
       {
         "hooks": [
           { "type": "command", "command": "@root@/hooks/announce-graph" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "@root@/hooks/cold-return" }
         ]
       }
     ],

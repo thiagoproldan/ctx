@@ -47,8 +47,19 @@ eval "$(printf '%s' "$input" | jq -r '
 
 # The session id names files below: nothing that could leave the directory.
 case "$sid" in '' | */* | .*) exit 0 ;; esac
-[ "$active" = "true" ] && exit 0
 pending=$(int_or "$pending" 0)
+
+# While background work or a scheduled wakeup would resume the session, the
+# prompt it sends has nobody to send it again: hooks/cold-return lets prompts
+# through as long as this mark is there. Only a Stop hook's input lists them,
+# so the mark is kept at every stop, a continued one included.
+scheduled="$STATE/cold/$sid.scheduled"
+if [ "$pending" -gt 0 ]; then
+  { mkdir -p "$STATE/cold" && : >"$scheduled"; } 2>/dev/null
+else
+  rm -f -- "$scheduled" 2>/dev/null
+fi
+[ "$active" = "true" ] && exit 0
 
 tokens=$(ctx_context_tokens "$transcript")
 

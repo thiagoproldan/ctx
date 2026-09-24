@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# UserPromptSubmit: a prompt that comes back to a big session after the prompt
+# cache has expired is stopped once, with what going on would cost and how old
+# the handoff is, so that the user picks between /clear and paying for it.
+#
+# Claude Code keeps the context cached for an hour. Past that, the next call
+# writes all of it back to the cache, at twice the input price, before any
+# work: in the 30 days to 2026-09-24, 65 such rewrites after an hour or more
+# idle made 7.5% of the bill, at a median context of 525k, and 58 of them came
+# with the user's next prompt. One of 530k cost 7 points of the 5-hour window
+# on 2026-09-23 -- about 175k units a point, in units where input is 1 and a
+# cache write 2. Starting over costs too: the new session writes its ~45k
+# prefix and spends ~331k units finding its way (the mean over those 30 days),
+# ~2 points in all. The reason gives both prices; under ~210k of context going
+# on is the cheaper, hence the default of 250k, the Stop hook's threshold. The
+# handoff is mostly there by then: the Stop hook asks for one at each band, and
+# /handoff at the user's moment.
+#
+# The stop costs nothing: no call is made, and Claude Code shows the reason
+# with the prompt under it. Sent again, the prompt goes through; each stop is
+# keyed to the last call it followed, so the next pause after more work can
+# stop again. A slash command always goes through: it is the user's own
+# choice (/handoff, for one), made knowing what it costs. So does a prompt
+# while background work or a scheduled wakeup would resume the session: the
+# hook's input does not say who sent the prompt, and one a cron or a /loop
+# sent has nobody to send it again. The Stop hook, whose input lists them,
+# keeps the mark.
+set -u
+
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
+
+int_or() { case "${1:-}" in '' | *[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+min_tokens=$(int_or "${CTX_COLD_TOKENS:-}" 250000)
+minutes=$(int_or "${CTX_COLD_MINUTES:-}" 60)
+threshold=$(int_or "${CTX_HANDOFF_TOKENS:-}" 250000)
+{ [ "$min_tokens" -gt 0 ] && [ "$minutes" -gt 0 ]; } || exit 0
+STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/handoff.sh
+. "$ROOT/lib/handoff.sh"
+
+input=$(cat)
+sid="" transcript="" slash=false
+eval "$(printf '%s' "$input" | jq -r '
+  @sh "sid=\(.session_id // "" | tostring) transcript=\(.transcript_path // "" | tostring) slash=\(.prompt // "" | tostring | test("^\\s*/"))"
+' 2>/dev/null)" 2>/dev/null
+
+# The session id names a file below: nothing that could leave the directory.
+case "$sid" in '' | */* | .*) exit 0 ;; esac
+[ "$slash" = "true" ] && exit 0
+
+tokens=0 at=0
+read -r tokens at <<<"$(ctx_last_call "$transcript")"
+{ [ "$tokens" -ge "$min_tokens" ] && [ "$at" -gt 0 ]; } || exit 0
+idle=$(($(date +%s) - at))
+[ "$idle" -ge $((minutes * 60)) ] || exit 0
+
+# shellcheck source=../lib/ledger.sh
+. "$ROOT/lib/ledger.sh"
+
+if [ -e "$STATE/cold/$sid.scheduled" ]; then
+  CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log cold-scheduled "$sid" tokens "$tokens" idle "$((idle / 60))"
+  exit 0
+fi
+
+book="$STATE/cold/$sid"
+seen=""
+[ -r "$book" ] && read -r seen <"$book"
+if [ "$seen" = "$at" ]; then
+  CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log cold-pass "$sid" tokens "$tokens" idle "$((idle / 60))"
+  exit 0
+fi
+# Without the book the prompt sent again would be stopped again, and the
+# session would be stuck: a failed write lets the prompt through instead.
+{ mkdir -p "$STATE/cold" && printf '%s\n' "$at" >"$book"; } 2>/dev/null || exit 0
+# Books of sessions long gone.
+find "$STATE/cold" -type f -mtime +7 -delete 2>/dev/null
+
+k() { echo "$(($1 / 1000))k"; }
+hours=$((idle / 3600))
+if [ "$hours" -ge 48 ]; then
+  away="$((hours / 24)) days"
+elif [ "$hours" -ge 1 ]; then
+  away=$(printf '%dh%02dm' "$hours" $((idle % 3600 / 60)))
+else
+  away="$((idle / 60))m"
+fi
+# points <units> -- in points of the 5-hour window, rounded.
+points() {
+  local n=$((($1 + 87500) / 175000))
+  case "$n" in
+    0) echo "under a point" ;;
+    1) echo "~1 point" ;;
+    *) echo "~$n points" ;;
+  esac
+}
+going=$(points $((2 * tokens)))
+fresh=$(points $((2 * 45000 + 331000)))
+
+written=$(ctx_handoff_written "$STATE" "$sid")
+again="/handoff first costs this same rewrite."
+if [ -z "$written" ]; then
+  handoff="No handoff from this session: /clear starts from the board as it is; $again"
+elif [ "$written" -gt "$tokens" ]; then
+  handoff="The last handoff is from before a compaction: /clear starts from it, without the work since; $again"
+elif [ $((tokens - written)) -lt $((threshold / 10)) ]; then
+  handoff="The handoff written $(k $((tokens - written))) tokens ago holds this session: /clear starts the next one from it."
+else
+  handoff="The last handoff is $(k $((tokens - written))) tokens old: /clear starts from it, without the work since; $again"
+fi
+
+CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log cold-stop "$sid" tokens "$tokens" idle "$((idle / 60))" written "$written"
+
+jq -n --arg r "ctx: idle $away, and the prompt cache has expired: this prompt would first write all $(k "$tokens") tokens of context back to the cache, at twice the input price.
+Going on here costs $going of the 5-hour window before any work; starting over, $fresh (the new session's prime and first reads).
+$handoff
+Sent again, the prompt goes through." '{decision: "block", reason: $r}'

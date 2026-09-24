@@ -442,7 +442,11 @@ is "past 250k again after compaction: asks" ask "$(stop a 270000)"
 is "stop hook already continuing: quiet" quiet "$(stop b 300000 true)"
 is "...and the ask is still owed" ask "$(stop b 300000)"
 is "background task running: quiet" quiet "$(stop c 300000 false 1)"
+has "...marked, for the cold-return hook" present "c.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
 is "...asked at the next idle stop" ask "$(stop c 300000)"
+has "...and the mark gone" absent "c.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
+is "continued stop, task running: quiet" quiet "$(stop e 300000 true 1)"
+has "...marked all the same" present "e.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
 is "missing transcript: quiet" quiet "$(stop_json d "$TMP/none.jsonl" | ho)"
 transcript "$TMP/tr-x.jsonl" 300000
 is "session id with a slash: quiet" quiet "$(stop_json ../x "$TMP/tr-x.jsonl" | ho)"
@@ -565,6 +569,111 @@ has "fresh keeps the size colour" present "${ESC}[33mctx 335k ✓" \
   "$(jq -nc '{session_id: "v", context_window: {total_input_tokens: 335000}}' | env -u NO_COLOR "$SL")"
 has "session id with a slash: no age" absent "ago" \
   "$(jq -nc '{session_id: "../v", context_window: {total_input_tokens: 335000}}' | env NO_COLOR=1 "$SL")"
+
+# --- cold return (UserPromptSubmit) -------------------------------------------------
+# A prompt that comes back to a big session past the cache's hour is stopped
+# once, with the cost and the handoff's age; sent again it goes through, and so
+# does a slash command. The defaults are what is tested.
+echo "cold return (UserPromptSubmit):"
+CR="$HOOKS/cold-return"
+# ctr <file> <main-thread tokens> <minutes since that call> -- after the call
+# come a message Claude Code wrote itself, a subagent's reply and a line still
+# being written, the first two dated later: a hook that read them would see no
+# pause at all.
+ctr() {
+  jq -nc --argjson t "$2" --arg at "$(date -u -d "@$(($(date +%s) - $3 * 60))" +%Y-%m-%dT%H:%M:%S.123Z)" '
+    {type: "user", message: {content: "hi"}},
+    {type: "assistant", timestamp: $at, message: {model: "claude-opus-5-5", usage: {input_tokens: 2,
+      cache_creation_input_tokens: 1000, cache_read_input_tokens: ($t - 1002)}}},
+    {type: "assistant", timestamp: "2099-01-01T00:00:00.000Z",
+     message: {model: "<synthetic>", usage: {input_tokens: 0}}},
+    {type: "assistant", isSidechain: true, timestamp: "2099-01-01T00:00:00.000Z",
+     message: {usage: {input_tokens: 900000}}}' >"$1"
+  printf '{"type":"assis' >>"$1"
+}
+# prompt_json <session> <transcript> [prompt]
+prompt_json() {
+  jq -nc --arg s "$1" --arg t "$2" --arg p "${3:-go on}" '
+    {session_id: $s, transcript_path: $t, hook_event_name: "UserPromptSubmit", prompt: $p}'
+}
+cr() { env -u CTX_DISABLE -u CTX_COLD_TOKENS -u CTX_COLD_MINUTES -u CTX_HANDOFF_TOKENS "$@" "$CR" 2>&1; }
+# back <session> <tokens> <minutes idle> [prompt] -- a new transcript each time
+back() {
+  ctr "$TMP/cr-$1.jsonl" "$2" "$3"
+  prompt_json "$1" "$TMP/cr-$1.jsonl" "${4:-go on}" | cr
+}
+# guarded <name> <stop|pass> <output> -- empty output passes, a block with a
+# reason stops, anything else PARSE-ERR (never a pass by accident).
+guarded() {
+  local name="$1" want="$2" out="$3" got
+  if [ -z "${out//[[:space:]]/}" ]; then
+    got=pass
+  else
+    got=$(printf '%s' "$out" | jq -er 'select(.decision == "block" and (.reason | length > 0)) | "stop"' 2>/dev/null) || got=PARSE-ERR
+  fi
+  if [ "$got" = "$want" ]; then
+    pass=$((pass + 1))
+    printf '  ok    %-50s -> %s\n' "$name" "$got"
+  else
+    fail=$((fail + 1))
+    printf '  FAIL  %-50s -> %s (expected %s)\n' "$name" "$got" "$want"
+    [ -n "$out" ] && printf '        %s\n' "$(printf '%s' "$out" | head -3)"
+  fi
+}
+crwhy() { printf '%s' "$1" | jq -r '.reason // ""' 2>/dev/null; }
+
+guarded "240k, idle 2h: passes" pass "$(back c1 240000 120)"
+guarded "344k, idle 59m: passes" pass "$(back c2 344000 59)"
+out=$(back c3 344000 72)
+guarded "344k, idle 72m: stops" stop "$out"
+has "says how long it sat idle" present "idle 1h12m" "$(crwhy "$out")"
+has "names the context to re-write" present "all 344k tokens" "$(crwhy "$out")"
+has "prices going on in the 5-hour window" present "Going on here costs ~4 points of the 5-hour window" "$(crwhy "$out")"
+has "...and starting over" present "starting over, ~2 points" "$(crwhy "$out")"
+has "no handoff: the board as it is" present "No handoff from this session" "$(crwhy "$out")"
+has "offers /clear" present "/clear" "$(crwhy "$out")"
+has "a subagent's 900k is not the context" absent "900k" "$(crwhy "$out")"
+guarded "...sent again: passes" pass "$(prompt_json c3 "$TMP/cr-c3.jsonl" "go on, then" | cr)"
+has "the stop is logged" present '"ev":"cold-stop"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
+has "...and the prompt sent again" present '"ev":"cold-pass"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
+guarded "more work, then a new pause: stops again" stop "$(back c3 350000 65)"
+guarded "a slash command passes" pass "$(back c4 344000 90 "/handoff")"
+guarded "...with a space before it too" pass "$(back c4 344000 90 " /handoff")"
+mkdir -p "$CTX_STATE/cold" && : >"$CTX_STATE/cold/c10.scheduled"
+guarded "a wakeup or background work pending: passes" pass "$(back c10 344000 90)"
+has "...and is logged" present '"ev":"cold-scheduled"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
+printf '340000\n' >"$CTX_STATE/handoff/c5.written"
+has "fresh handoff: holds the session" present "handoff written 4k tokens ago holds this session" \
+  "$(crwhy "$(back c5 344000 90)")"
+printf '264000\n' >"$CTX_STATE/handoff/c6.written"
+has "stale handoff: its age" present "last handoff is 80k tokens old" "$(crwhy "$(back c6 344000 90)")"
+printf '400000\n' >"$CTX_STATE/handoff/c7.written"
+has "handoff from before a compaction: says so" present "from before a compaction" \
+  "$(crwhy "$(back c7 344000 90)")"
+has "three days away: in days" present "idle 3 days" "$(crwhy "$(back c8 344000 4320)")"
+has "530k: ~6 points" present "~6 points" "$(crwhy "$(back c9 530000 90)")"
+guarded "missing transcript: passes" pass "$(prompt_json d1 "$TMP/none.jsonl" | cr)"
+ctr "$TMP/cr-x.jsonl" 344000 90
+guarded "session id with a slash: passes" pass "$(prompt_json ../x "$TMP/cr-x.jsonl" | cr)"
+guarded "CTX_DISABLE=1: passes" pass "$(prompt_json x1 "$TMP/cr-x.jsonl" | CTX_DISABLE=1 "$CR" 2>&1)"
+guarded "CTX_COLD_TOKENS=0: passes" pass "$(prompt_json x2 "$TMP/cr-x.jsonl" | cr CTX_COLD_TOKENS=0)"
+guarded "CTX_COLD_MINUTES=0: passes" pass "$(prompt_json x3 "$TMP/cr-x.jsonl" | cr CTX_COLD_MINUTES=0)"
+guarded "CTX_COLD_MINUTES=120: 90m passes" pass "$(prompt_json x4 "$TMP/cr-x.jsonl" | cr CTX_COLD_MINUTES=120)"
+ctr "$TMP/cr-w.jsonl" 344000 17
+has "CTX_COLD_MINUTES=10: 17m, in minutes" present "idle 17m, and the prompt cache has expired" \
+  "$(crwhy "$(prompt_json w1 "$TMP/cr-w.jsonl" | cr CTX_COLD_MINUTES=10)")"
+guarded "state that cannot be written: passes" pass \
+  "$(prompt_json x5 "$TMP/cr-x.jsonl" | cr CTX_STATE="$TMP/big.ts/state")"
+ctr "$TMP/cr-y.jsonl" 120000 90
+guarded "CTX_COLD_TOKENS=100000: 120k stops" stop "$(prompt_json y1 "$TMP/cr-y.jsonl" | cr CTX_COLD_TOKENS=100000)"
+jq -nc '{type: "assistant", message: {usage: {input_tokens: 344000}}}' >"$TMP/cr-z.jsonl"
+guarded "a call with no time on it: passes" pass "$(prompt_json z1 "$TMP/cr-z.jsonl" | cr)"
+out=$(
+  printf 'not json' | cr
+  echo "rc=$?"
+)
+has "malformed input: exit 0" present "rc=0" "$out"
+has "malformed input: nothing printed" absent "{" "$out"
 
 # --- live: the worker ---------------------------------------------------------------
 # Not hermetic (needs the worker signed in via ctx-login, and the network), so
