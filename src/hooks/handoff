@@ -14,9 +14,23 @@
 # and so on; a compaction that brings the context back down re-arms the bands
 # it came back under. The 5-hour window past CTX_HANDOFF_5H asks once, and
 # again only after the window has come back under it. Never while a stop hook
-# is already continuing the turn, and never while background work or a
-# scheduled wakeup would resume the session -- a /clear then would drop it --
-# in which case it asks at the next stop instead.
+# is already continuing the turn, and not while background work or a scheduled
+# wakeup would resume the session with the user there: it asks at the next
+# stop instead. A /clear does not drop a background shell -- its notification
+# reaches the fresh session (measured 2026-09-26, ekko gotcha 777) -- but the
+# fresh session gets it without knowing why the task ran.
+#
+# When the user is away -- nothing typed for CTX_AUTO_RESET_IDLE minutes
+# (default 10; 0 turns this off), read off the transcript by ctx_last_human --
+# the session runs alone, and the user asked (ekko task 747) for the same
+# ritual without them: past the threshold it asks for the handoff even with
+# background shells running, telling Claude to name them in it; and once a
+# fresh handoff is written, it starts bin/auto-reset, which types /clear and
+# 'continuando' into the session's own Konsole tab. Only in Konsole, only in
+# an interactive session (CLAUDE_CODE_ENTRYPOINT cli), and not while anything
+# but a background shell is pending: a scheduled wakeup, a monitor or a
+# subagent was not tested across a /clear. The 5-hour trigger never resets: a
+# reset costs the window, it does not spare it.
 #
 # Nor when a handoff this session wrote is still fresh: less than a tenth of
 # the threshold of context since (hooks/handoff-written notes each one). The
@@ -40,14 +54,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/lib/handoff.sh"
 
 input=$(cat)
-sid="" transcript="" active=false pending=0
+sid="" transcript="" active=false pending=0 unshelled=0
 eval "$(printf '%s' "$input" | jq -r '
-  @sh "sid=\(.session_id // "" | tostring) transcript=\(.transcript_path // "" | tostring) active=\(.stop_hook_active == true) pending=\((.background_tasks // []) + (.session_crons // []) | length)"
+  (.background_tasks // []) as $tasks | (.session_crons // []) as $crons
+  | @sh "sid=\(.session_id // "" | tostring) transcript=\(.transcript_path // "" | tostring) active=\(.stop_hook_active == true) pending=\($tasks + $crons | length) unshelled=\([$tasks[] | select(.type != "shell")] + $crons | length)"
 ' 2>/dev/null)" 2>/dev/null
 
 # The session id names files below: nothing that could leave the directory.
 case "$sid" in '' | */* | .*) exit 0 ;; esac
 pending=$(int_or "$pending" 0)
+unshelled=$(int_or "$unshelled" 0)
 
 # While background work or a scheduled wakeup would resume the session, the
 # prompt it sends has nobody to send it again: hooks/cold-return lets prompts
@@ -59,9 +75,61 @@ if [ "$pending" -gt 0 ]; then
 else
   rm -f -- "$scheduled" 2>/dev/null
 fi
-[ "$active" = "true" ] && exit 0
 
 tokens=$(ctx_context_tokens "$transcript")
+
+# claude_pid -- Claude Code's own pid: the nearest ancestor of this hook
+# named after it.
+claude_pid() {
+  local p=$PPID c
+  while [ "${p:-0}" -gt 1 ]; do
+    c=$(cat "/proc/$p/comm" 2>/dev/null)
+    case "$c" in *claude*)
+      echo "$p"
+      return 0
+      ;;
+    esac
+    p=$(awk '$1 == "PPid:" { print $2 }' "/proc/$p/status" 2>/dev/null)
+  done
+  return 1
+}
+
+# Whether the session runs alone: the user away, in a Konsole tab ctx can type
+# into, nothing but background shells pending. Read only past the threshold,
+# where it can change what happens.
+idle_min=$(int_or "${CTX_AUTO_RESET_IDLE:-}" 10)
+alone=0 away=0 cpid=""
+if [ "$idle_min" -gt 0 ] && [ "$threshold" -gt 0 ] && [ "$tokens" -ge "$threshold" ] &&
+  [ "$unshelled" -eq 0 ] && [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "cli" ] &&
+  [ -n "${KONSOLE_DBUS_SERVICE:-}" ] && [ -n "${KONSOLE_DBUS_SESSION:-}" ] &&
+  cpid=$(claude_pid); then
+  at=0 known=0
+  read -r at _ known <<<"$(ctx_last_human "$transcript" "$STATE/auto/$sid.typed")"
+  if [ "$known" = "1" ]; then
+    away=$((($(date +%s) - at) / 60))
+    [ "$away" -ge "$idle_min" ] && alone=1
+  fi
+fi
+
+# shellcheck source=../lib/ledger.sh
+. "$ROOT/lib/ledger.sh"
+
+# Alone, with a fresh handoff written: the reset, typed by bin/auto-reset once
+# this turn has ended. Detached, with no descriptor of this hook's: Claude
+# Code waits for the hook's output to close.
+written=$(ctx_handoff_written "$STATE" "$sid")
+if [ "$alone" -eq 1 ] && [ -n "$written" ] && [ "$tokens" -ge "$written" ] &&
+  [ $((tokens - written)) -lt $((threshold / 10)) ]; then
+  if [ ! -d "$STATE/auto/$sid.lock" ]; then
+    CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log auto-reset-start "$sid" \
+      tokens "$tokens" written "$written" away "$away" pending "$pending"
+    setsid -f "$ROOT/bin/auto-reset" "$sid" "$transcript" "$cpid" \
+      </dev/null >/dev/null 2>&1
+  fi
+  exit 0
+fi
+
+[ "$active" = "true" ] && exit 0
 
 five=""
 reading="$STATE/sessions/$sid"
@@ -98,7 +166,10 @@ record() {
   printf '%s %s\n' "$1" "$2" >"$book" 2>/dev/null || true
 }
 
-if { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; } || [ "$pending" -gt 0 ]; then
+# Pending work defers the ask while the user is there to ask at the next
+# stop; alone, background shells are no reason to wait (see the top).
+if { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; } ||
+  { [ "$pending" -gt 0 ] && [ "$alone" -eq 0 ]; }; then
   if [ "$last_band" != "$was_band" ] || [ "$last_hot" != "$was_hot" ]; then
     record "$last_band" "$last_hot"
   fi
@@ -111,12 +182,8 @@ record "$last_band" "$last_hot"
 # Readings and books of sessions long gone.
 find "$STATE/sessions" "$STATE/handoff" -type f -mtime +7 -delete 2>/dev/null
 
-# shellcheck source=../lib/ledger.sh
-. "$ROOT/lib/ledger.sh"
-
 # A handoff written moments ago already holds the session: the band counts as
 # asked, and the status line shows how fresh the handoff is.
-written=$(ctx_handoff_written "$STATE" "$sid")
 if [ -n "$written" ] && [ "$tokens" -ge "$written" ] &&
   [ $((tokens - written)) -lt $((threshold / 10)) ]; then
   CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff-fresh "$sid" \
@@ -132,8 +199,18 @@ why=""
   why="${why:+$why, and }the 5-hour usage window is at ${five}%, past ${limit_5h}%"
 
 CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff "$sid" \
-  tokens "$tokens" five "$five" band "$band"
+  tokens "$tokens" five "$five" band "$band" alone "$alone"
 
-jq -n --arg m "ctx: $why. $(ctx_handoff_text "$ROOT")
+# Alone, the reset follows the handoff by itself: the /clear above is ctx's to
+# type, and the fresh session is all that will know of a task still running.
+auto=""
+if [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ]; then
+  auto="
+The user has been away for ${away} minutes: once the handoff is written and this turn ends, ctx types /clear and '${CTX_AUTO_RESET_PROMPT:-continuando}' into this session's tab, and a fresh session goes on from the handoff."
+  [ "$pending" -gt 0 ] && auto="$auto
+Background tasks are still running, and their notifications will reach the fresh session: name each in the handoff, with what it does and the file its output goes to."
+fi
+
+jq -n --arg m "ctx: $why. $(ctx_handoff_text "$ROOT")$auto
 Start no new work in this turn." \
   '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: $m}}'

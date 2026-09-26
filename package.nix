@@ -14,6 +14,7 @@
   jq,
   shfmt,
   systemd,
+  util-linux,
 }:
 let
   # Everything the scripts call. Appended to PATH (--suffix), not prepended: the
@@ -31,12 +32,13 @@ let
     jq
     python3
     shfmt
-    systemd # busctl, for `ctx-test --live`
+    systemd # busctl: Konsole (bin/auto-reset), and `ctx-test --live`
+    util-linux # setsid: hooks/handoff detaches bin/auto-reset
   ];
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "ctx";
-  version = "0.3.0";
+  version = "0.4.0";
 
   src = ./src;
 
@@ -54,7 +56,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
 
     root=$out/share/ctx
     mkdir -p $root $out/bin
-    cp -r hooks lib bin skills report.sh test-hooks.sh $root/
+    cp -r hooks lib bin skills test-data report.sh test-hooks.sh $root/
     chmod +x $root/hooks/* $root/bin/* $root/report.sh $root/test-hooks.sh
 
     # The plugin directory holds only the manifest: Claude Code discovers

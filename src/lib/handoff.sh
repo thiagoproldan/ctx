@@ -53,6 +53,40 @@ ctx_last_call() {
   echo "$out"
 }
 
+# ctx_last_human <transcript> [typed] -- "<epoch> <uuid> <known>": when the
+# user last typed into this session, in seconds, and that row's uuid; "0 - 1"
+# when no row is the user's, "0 - 0" when the transcript cannot tell.
+#
+# A prompt the user typed, a suggestion they accepted and a slash command carry
+# origin.kind "human"; a background task's notification ("task-notification")
+# and a resume after a usage limit ("auto-continuation") do not, although both
+# fire UserPromptSubmit like a typed prompt (ekko gotcha 764). What ctx typed
+# itself is recorded as "human" too: bin/auto-reset lists those rows' uuids in
+# <typed>, and they are passed over. <known> is 0 when no user row carries an
+# origin at all -- a transcript from a Claude Code that does not write it --
+# so that a missing field never reads as an absent user.
+ctx_last_human() {
+  local transcript="${1:-}" typed="${2:-}" skip='[]' out=""
+  if [ -n "$typed" ] && [ -r "$typed" ]; then
+    skip=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$typed" 2>/dev/null) || skip='[]'
+  fi
+  if [ -n "$transcript" ] && [ -r "$transcript" ]; then
+    out=$(jq -nrR --argjson skip "$skip" '
+      reduce (inputs | fromjson? | objects | select(.type == "user")) as $r
+        ({at: 0, uuid: "-", known: 0};
+         if ($r.origin | type) == "object" then .known = 1 else . end
+         | if $r.origin.kind == "human" and ($r.uuid // "" | IN($skip[]) | not) then
+             .at = ($r.timestamp // "" | tostring | sub("\\.[0-9]+"; "")
+                    | try fromdateiso8601 catch 0)
+             | .uuid = ($r.uuid // "-" | tostring)
+           else . end)
+      | "\(.at | floor) \(.uuid) \(.known)"
+    ' <"$transcript" 2>/dev/null)
+  fi
+  [[ "$out" =~ ^[0-9]+\ [^[:space:]]+\ [01]$ ]] || out="0 - 0"
+  echo "$out"
+}
+
 # ctx_handoff_text <root> -- the ask, without the reason for it: the body of
 # skills/handoff/SKILL.md, so the Stop hook and /handoff say the same thing.
 ctx_handoff_text() {

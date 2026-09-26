@@ -1,0 +1,7 @@
+● Background command "Wait 45 seconds then print marker" completed (exit code 0)
+· Scurrying… (1s · thinking with xhigh effort)
+  ⎿  Tip: Run /install-github-app to tag @claude right from your Github issues and PRs
+──────────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────────
+  Opus 5.5 xhigh · ctx 0 · 5h 33% ↺21:20 · 7d 4%

@@ -39,7 +39,9 @@ plugin, the same way ekko is.
    - `handoff` — `Stop`: past `CTX_HANDOFF_TOKENS` of context (250k), or the
      5-hour window past `CTX_HANDOFF_5H` (85%), keeps the turn open once and
      asks for the ekko handoff and a `/clear` — unless a handoff the session
-     wrote moments before already holds it.
+     wrote moments before already holds it. With the user away, it has
+     `bin/auto-reset` type the `/clear` and `continuando` into the session's
+     Konsole tab (see _A session left alone_).
    - `handoff-written` — `PostToolUse` on ekko's `create` and `batch`: notes the
      context at which the session wrote a handoff, so its age can be shown.
    - `cold-return` — `UserPromptSubmit`: a prompt that comes back to a context
@@ -85,9 +87,11 @@ At the end of each turn, the `handoff` hook:
   window comes back under it. A Stop hook's input carries no rate limits, so
   the status line leaves each session's reading in `$CTX_STATE/sessions/`, and
   the hook trusts it for 10 minutes;
-- stays quiet while a stop hook is already continuing the turn, and while
-  background work or a scheduled wakeup would resume the session — a `/clear`
-  then would drop it. It asks at the next stop instead;
+- stays quiet while a stop hook is already continuing the turn, and, with the
+  user there, while background work or a scheduled wakeup would resume the
+  session: it asks at the next stop instead. A `/clear` does not drop a
+  background shell — its notification reaches the fresh session (measured
+  2026-09-26) — but the fresh session gets it without knowing why it ran;
 - stays quiet, and counts the band as asked, while a handoff this session wrote
   is fresh: less than a tenth of the threshold of context since it;
 - logs each ask, and each one a fresh handoff spared, to
@@ -148,6 +152,53 @@ whether the hook pays.
 In a folder without an ekko board, the ask only tells the user. ekko needs
 nothing new for this: the handoff is an ekko note of kind `handoff`, which the
 next session's prime shows first.
+
+### A session left alone
+
+A session left to run on its own — watching a long job overnight, say — used
+to stall at the handoff, or go on paying for an ever larger context, until
+someone typed `/clear` and `continuando`. Now the same ritual runs without
+them, with no switch to remember: the session tells by itself whether the user
+is there.
+
+- **Away** means nothing typed for `CTX_AUTO_RESET_IDLE` minutes (10), read
+  off the transcript: a prompt the user typed carries `origin.kind` `human`,
+  while a background task's notification and a resume after a usage limit do
+  not, though both fire `UserPromptSubmit` like a typed prompt. A transcript
+  that carries no `origin` at all never reads as away.
+- Away, past the threshold, the Stop hook asks for the handoff even with
+  background shells running, and has Claude name each in it with its output
+  file: a `/clear` does not stop them, and their notifications reach the fresh
+  session.
+- Once a fresh handoff is written, the Stop hook starts `bin/auto-reset`,
+  detached. It waits for the turn to end, types `/clear`, waits for the fresh
+  session's transcript, then types `CTX_AUTO_RESET_PROMPT` (`continuando`),
+  logging `auto-reset` or `auto-reset-stop` with the reason to
+  `$CTX_STATE/handoff.jsonl`.
+
+It types only into Konsole, through the D-Bus object Konsole exports into each
+tab's shell (`KONSOLE_DBUS_SERVICE`, `KONSOLE_DBUS_SESSION`), which Claude Code
+and its hooks inherit. Konsole 26.08 refuses typed input over D-Bus unless
+**Configure Konsole › General › Enable the security sensitive parts of the
+DBus API** is on (`[KonsoleWindow] EnableSecuritySensitiveDBusAPI=true` in
+`konsolerc`), and with it on, any process of the user can type into any tab.
+An empty `sendText` tells which, typing nothing. Elsewhere — another
+terminal, tmux, `claude -p` (`CLAUDE_CODE_ENTRYPOINT` other than `cli`) — the
+ask is as before and nothing is typed. So it is while a scheduled wakeup, a
+monitor or a subagent is pending: none was tried across a `/clear`.
+
+Before each keystroke, `bin/auto-reset` checks that the tab's foreground
+process is this session's Claude Code, that the user has typed nothing since
+it started, and that the screen (`getAllDisplayedText`) shows the session
+idle with its input box holding exactly what it typed so far. A permission
+dialog opens with `1. Yes` selected, so an Enter typed into one would approve
+the call. What was measured on 2026-09-26 (Claude Code 2.1.283) shaped the
+rest: a long text sent with its Enter in one `sendText` is taken as a paste,
+and the Enter becomes a newline, so each Enter goes alone, half a second
+later. A prompt typed this way is recorded as the user's own, so the rows ctx
+typed are listed in `$CTX_STATE/auto/<session>.typed` and passed over when
+presence is read. The 5-hour trigger never resets: a reset spends the window,
+it does not spare it.
 
 ## The worker: Gemini through `agy`, sandboxed
 
@@ -308,6 +359,9 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
 | `CTX_COLD_TOKENS`       | `250000`                  | Cold-return hook: context worth stopping a prompt for (0 off)      |
 | `CTX_COLD_MINUTES`      | `60`                      | Cold-return hook: idle minutes that make the cache cold (0 off)    |
+| `CTX_AUTO_RESET_IDLE`   | `10`                      | Stop hook: idle minutes that make the user away (0 off)            |
+| `CTX_AUTO_RESET_PROMPT` | `continuando`             | Auto reset: what it types into the fresh session                   |
+| `CTX_AUTO_RESET_WAIT`   | `300`                     | Auto reset: seconds each wait lasts before it gives up             |
 
 ## Moving from shunt
 

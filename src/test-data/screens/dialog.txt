@@ -1,0 +1,36 @@
+  
+
+✻ Crunched for 1s · done 5:26 PM
+
+❯ escreva um parágrafo de umas 150 palavras sobre terminais                                                                           
+
+● O terminal é uma das ferramentas mais duradouras da computação. Nasceu como um equipamento físico, o teletipo, que enviava
+  caracteres a um computador central e imprimia as respostas em papel. Com o tempo, virou uma tela de vídeo e, depois, um programa que
+  emula esse equipamento dentro de uma interface gráfica. Hoje, emuladores como Alacritty, Kitty, GNOME Terminal e Windows Terminal
+  conversam com o shell por meio de um pseudoterminal, o pty, e interpretam sequências de escape ANSI para desenhar cores, mover o
+  cursor e redimensionar a área de texto. Apesar da aparência austera, o terminal continua sendo o meio mais direto de controlar um
+  sistema: permite combinar pequenos programas com pipes, automatizar tarefas com scripts e administrar máquinas remotas via SSH. Sua
+  força está justamente na simplicidade: texto entra, texto sai, e qualquer ferramenta pode se encaixar nesse fluxo sem precisar
+  conhecer as outras.
+  
+✻ Crunched for 5s · done 5:27 PM
+  
+❯ rode o comando de shell: touch /tmp/ctx-747-scratch/teste2.txt                                                                      
+  
+  Creating empty test file in scratch directory
+  ⎿  $ touch /tmp/ctx-747-scratch/teste2.txt
+  
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+
+   touch /tmp/ctx-747-scratch/teste2.txt
+   Create empty test file in scratch directory
+
+ Do you want to proceed?
+ ❯ 1. Yes                                                                                               
+   2. Yes, and always allow access to /tmp/ctx-747-scratch from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+  
+ Esc to cancel · Tab to amend

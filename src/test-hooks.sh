@@ -21,6 +21,13 @@ export CTX_STATE="$TMP/state"
 export CTX_FUNNEL="$TMP/funnel-suite.jsonl"
 export CTX_LEDGER="$TMP/usage-suite.jsonl"
 
+# Never the real tab. Run from a Claude Code session, the suite inherits the
+# D-Bus address of the Konsole tab the user works in, and bin/auto-reset types
+# into whatever these name. Here they name nothing; the auto-reset cases set
+# their own, answered by a fake busctl.
+export KONSOLE_DBUS_SERVICE=ctx.test.invalid KONSOLE_DBUS_SESSION=/Sessions/0
+unset CLAUDE_CODE_ENTRYPOINT
+
 seq 1 900 | sed 's/^/line /' >"$TMP/big.ts"  # 900 lines
 seq 1 40 | sed 's/^/line /' >"$TMP/small.ts" # 40 lines
 cp "$TMP/big.ts" "$TMP/big.png"
@@ -569,6 +576,249 @@ has "fresh keeps the size colour" present "${ESC}[33mctx 335k ✓" \
   "$(jq -nc '{session_id: "v", context_window: {total_input_tokens: 335000}}' | env -u NO_COLOR "$SL")"
 has "session id with a slash: no age" absent "ago" \
   "$(jq -nc '{session_id: "../v", context_window: {total_input_tokens: 335000}}' | env NO_COLOR=1 "$SL")"
+
+# --- auto reset: the session alone ---------------------------------------------------
+# Away from the keyboard, past the threshold, with a fresh handoff, the Stop hook
+# starts bin/auto-reset, which types /clear and 'continuando' into the session's
+# Konsole tab. Here the tab is a fake busctl playing Konsole with Claude Code in
+# it: it keeps the input box, an Enter on /clear starts a fresh transcript, an
+# Enter on anything else appends it as a typed row.
+echo "auto reset (Stop, bin/auto-reset):"
+# eq <name> <expected> <got>
+eq() {
+  if [ "$3" = "$2" ]; then
+    pass=$((pass + 1))
+    printf '  ok    %-50s -> %s\n' "$1" "$3"
+  else
+    fail=$((fail + 1))
+    printf '  FAIL  %-50s -> %s (expected %s)\n' "$1" "$3" "$2"
+  fi
+}
+# shellcheck source=lib/konsole.sh
+. "$ROOT/lib/konsole.sh"
+# shellcheck source=lib/handoff.sh
+. "$ROOT/lib/handoff.sh"
+SCREENS="$ROOT/test-data/screens"
+
+# The guard, on six screens captured live on 2026-09-26: only an idle session
+# with an empty box may be typed into. busy2 has a hint line between the
+# spinner and the box, busy3 a tip: the first guard read those as idle.
+guard() { ctx_screen_idle "${2:-}" <"$SCREENS/$1.txt" >/dev/null && echo types || echo waits; }
+eq "idle, empty box" types "$(guard idle)"
+eq "busy" waits "$(guard busy)"
+eq "busy, a hint line under the spinner" waits "$(guard busy2)"
+eq "busy, a tip under the spinner" waits "$(guard busy3)"
+eq "the user's half-typed text" waits "$(guard text)"
+eq "permission dialog (Enter would approve)" waits "$(guard dialog)"
+eq "idle, but /clear expected in the box" waits "$(guard idle /clear)"
+RULE="────────────────────────────────────────"
+typed_screen() { printf '✻ Crunched for 1s · done\n%s\n❯\xc2\xa0%s\n%s\n  ctx 15k\n' "$RULE" "$1" "$RULE"; }
+eq "/clear typed, /clear expected" types "$(typed_screen /clear | ctx_screen_idle /clear >/dev/null && echo types || echo waits)"
+eq "/clear typed after the user's text" waits "$(typed_screen 'abc/clear' | ctx_screen_idle /clear >/dev/null && echo types || echo waits)"
+
+# rows <file> <tokens> <row>... -- a transcript: each row human:<minutes ago>[:uuid]
+# or note:<minutes ago> (a background task's notification), then a
+# main-thread call of <tokens>.
+rows() {
+  local f="$1" t="$2" r kind ago uuid
+  shift 2
+  : >"$f"
+  for r in "$@"; do
+    IFS=: read -r kind ago uuid <<<"$r"
+    jq -nc --arg k "$kind" --argjson a "$ago" --arg u "${uuid:-u$RANDOM}" '
+      {type: "user", uuid: $u,
+       origin: {kind: (if $k == "human" then "human" else "task-notification" end)},
+       timestamp: (now - $a * 60 | todate), message: {content: "x"}}' >>"$f"
+  done
+  jq -nc --argjson t "$t" '{type: "assistant", message: {usage: {input_tokens: 2,
+    cache_creation_input_tokens: 1000, cache_read_input_tokens: ($t - 1002)}}}' >>"$f"
+}
+ago() { read -r at _ known <<<"$(ctx_last_human "$@")"; [ "$known" = 1 ] && echo $((($(date +%s) - at) / 60)) || echo unknown; }
+rows "$TMP/p1.jsonl" 1000 human:30 note:5 note:1
+eq "the user typed 30m ago; notifications since" 30 "$(ago "$TMP/p1.jsonl")"
+rows "$TMP/p2.jsonl" 1000 human:30 human:2:mine note:1
+echo mine >"$TMP/p2.typed"
+eq "ctx's own typing is passed over" 30 "$(ago "$TMP/p2.jsonl" "$TMP/p2.typed")"
+transcript "$TMP/p3.jsonl" 1000
+eq "no origin on any row: unknown, never away" unknown "$(ago "$TMP/p3.jsonl")"
+
+# The fake tab. State in $FK: box (the input box), sent (each sendText, %q),
+# current (the transcript an Enter appends to), and flags deny, busy, dialog.
+FAKEBIN="$TMP/fakebin"
+mkdir -p "$FAKEBIN"
+cat >"$FAKEBIN/busctl" <<EOF
+#!$(command -v bash)
+set -u
+F="\$FK" json=0
+args=()
+for a in "\$@"; do
+  case "\$a" in --user) ;; --json=short) json=1 ;; *) args+=("\$a") ;; esac
+done
+# call <service> <path> <interface> <method> [signature argument]
+[ "\${args[0]}" = call ] && [ "\${args[1]}" = fake.konsole ] && [ "\${args[2]}" = /Sessions/7 ] || exit 1
+render() {
+  if [ -e "\$F/dialog" ]; then cat "$SCREENS/dialog.txt"
+  elif [ -e "\$F/busy" ]; then cat "$SCREENS/busy.txt"
+  else printf '✻ Crunched for 1s · done\n%s\n❯\xc2\xa0%s\n%s\n  ctx 15k\n' "$RULE" "\$(cat "\$F/box")" "$RULE"
+  fi
+}
+case "\${args[4]}" in
+  foregroundProcessId) echo "i \$(cat "\$F/fg")" ;;
+  getAllDisplayedText) render | jq -Rsc '{type: "s", data: [.]}' ;;
+  sendText)
+    [ -e "\$F/deny" ] && { echo "Call failed: Access denied" >&2; exit 1; }
+    # Another session of the same project, busy all along.
+    [ -s "\$F/other" ] && echo '{"type":"assistant"}' >>"\$(cat "\$F/other")"
+    t="\${args[6]:-}"
+    printf '%q\n' "\$t" >>"\$F/sent"
+    case "\$t" in
+      '') ;;
+      \$'\x15') : >"\$F/box" ;;
+      \$'\r')
+        b=\$(cat "\$F/box"); : >"\$F/box"
+        if [ "\$b" = /clear ]; then
+          n="\$(dirname "\$(cat "\$F/current")")/fresh-\$\$.jsonl"
+          cat "$ROOT/test-data/cleared.jsonl" >"\$n"
+          echo "\$n" >"\$F/current"
+        elif [ -n "\$b" ]; then
+          jq -nc --arg c "\$b" '{type: "user", uuid: "typed-row", origin: {kind: "human"},
+            timestamp: (now | todate), message: {content: \$c}}' >>"\$(cat "\$F/current")"
+        fi ;;
+      *) printf '%s' "\$t" >>"\$F/box" ;;
+    esac ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$FAKEBIN/busctl"
+# A process named claude stands for Claude Code: the tab's foreground, and the
+# ancestor hooks/handoff looks for.
+ln -sf "$(command -v bash)" "$FAKEBIN/claude"
+
+# tab <name> [flags...] -- a fresh fake tab around the transcript $TMP/ar-<name>/s-<name>.jsonl,
+# with Claude Code (this shell, standing in) in the foreground.
+tab() {
+  FK="$TMP/fk-$1"
+  rm -rf "$FK" "$TMP/ar-$1"
+  mkdir -p "$FK" "$TMP/ar-$1"
+  : >"$FK/box"
+  echo "$TMP/ar-$1/s-$1.jsonl" >"$FK/current"
+  echo "${FG:-$$}" >"$FK/fg"
+  shift
+  for f in "$@"; do : >"$FK/$f"; done
+  export FK
+}
+AR="$ROOT/bin/auto-reset"
+reset_env() { env -u CTX_DISABLE PATH="$FAKEBIN:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole \
+  KONSOLE_DBUS_SESSION=/Sessions/7 CTX_AUTO_RESET_WAIT="${WAIT:-4}" "$@"; }
+sent() { tr '\n' ' ' <"$FK/sent" 2>/dev/null; }
+said() { grep "\"sid\":\"$1\"" "$CTX_STATE/handoff.jsonl" 2>/dev/null | tail -1; }
+
+tab a1
+rows "$TMP/ar-a1/s-a1.jsonl" 300000 human:40
+# Another session here began with a /clear of its own, and keeps writing.
+cp "$ROOT/test-data/cleared.jsonl" "$TMP/ar-a1/other.jsonl"
+echo "$TMP/ar-a1/other.jsonl" >"$FK/other"
+reset_env "$AR" s-a1 "$TMP/ar-a1/s-a1.jsonl" $$
+eq "types /clear, Enter, the prompt, Enter" "'' /clear \$'\\r' continuando \$'\\r' " "$(sent)"
+has "...and logs the reset to the fresh session" present '"ev":"auto-reset","sid":"s-a1","to":"fresh-' "$(said s-a1)"
+has "...noting the prompt's row as ctx's own" present "typed-row" "$(cat "$CTX_STATE"/auto/fresh-*.typed 2>/dev/null)"
+has "...and its lock is gone" absent "s-a1.lock" "$(ls "$CTX_STATE/auto")"
+
+tab a2 deny
+rows "$TMP/ar-a2/s-a2.jsonl" 300000 human:40
+reset_env "$AR" s-a2 "$TMP/ar-a2/s-a2.jsonl" $$
+eq "Konsole refuses input: nothing typed" "" "$(sent)"
+has "...logged" present "refuses typed input" "$(said s-a2)"
+
+FG=1 tab a3
+rows "$TMP/ar-a3/s-a3.jsonl" 300000 human:40
+reset_env "$AR" s-a3 "$TMP/ar-a3/s-a3.jsonl" $$
+eq "another process in the tab: nothing typed" "'' " "$(sent)"
+has "...logged" present "not this session" "$(said s-a3)"
+
+for state in dialog busy; do
+  tab "a-$state" "$state"
+  rows "$TMP/ar-a-$state/s-a-$state.jsonl" 300000 human:40
+  WAIT=3 reset_env "$AR" "s-a-$state" "$TMP/ar-a-$state/s-a-$state.jsonl" $$
+  eq "$state for the whole wait: nothing typed" "'' " "$(sent)"
+done
+has "...the dialog is why" present "a dialog is open" "$(said s-a-dialog)"
+
+tab a4
+printf 'meio digitado' >"$FK/box"
+rows "$TMP/ar-a4/s-a4.jsonl" 300000 human:40
+WAIT=3 reset_env "$AR" s-a4 "$TMP/ar-a4/s-a4.jsonl" $$
+eq "the user's half-typed text: left alone" "'' " "$(sent)"
+
+tab a5 busy
+rows "$TMP/ar-a5/s-a5.jsonl" 300000 human:40
+WAIT=8 reset_env "$AR" s-a5 "$TMP/ar-a5/s-a5.jsonl" $$ &
+sleep 1.5
+rows "$TMP/ar-a5/new.jsonl" 300000 human:0
+cat "$TMP/ar-a5/new.jsonl" >>"$TMP/ar-a5/s-a5.jsonl"
+rm -f "$FK/busy"
+wait
+eq "the user types while it waits: nothing typed" "'' " "$(sent)"
+has "...logged" present "the user typed" "$(said s-a5)"
+
+# The Stop hook decides; run under a process named claude, as Claude Code runs it.
+# stop_auto <session> <stop json> [env...] -- the hook's output, in a Konsole tab
+# of an interactive session unless the env says otherwise.
+stop_auto() {
+  local j="$2"
+  shift 2
+  # shellcheck disable=SC2016 # $0 is the hook, for the inner shell
+  printf '%s' "$j" | env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H -u CTX_AUTO_RESET_IDLE \
+    PATH="$FAKEBIN:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
+    CTX_AUTO_RESET_WAIT=4 CLAUDE_CODE_ENTRYPOINT=cli "$@" "$FAKEBIN/claude" -c '"$0"; true' "$HO" 2>&1
+}
+# fresh_handoff <session> <tokens> -- as hooks/handoff-written leaves it
+fresh_handoff() { mkdir -p "$CTX_STATE/handoff" && echo "$2" >"$CTX_STATE/handoff/$1.written"; }
+# settled <session> -- the detached reset's last word, waited for
+settled() {
+  for _ in $(seq 1 40); do
+    said "$1" | grep -q -E '"ev":"auto-reset(-stop)?"' && break
+    sleep 0.25
+  done
+  said "$1"
+}
+
+FG=$$ tab h1
+rows "$TMP/ar-h1/s-h1.jsonl" 262000 human:40 note:1
+fresh_handoff s-h1 258000
+out=$(stop_auto s-h1 "$(stop_json s-h1 "$TMP/ar-h1/s-h1.jsonl" true 1)")
+is "alone, handoff fresh: quiet" quiet "$out"
+has "...the reset starts" present '"ev":"auto-reset-start","sid":"s-h1"' "$(cat "$CTX_STATE/handoff.jsonl")"
+last=$(settled s-h1)
+has "...a hook of ours reaches the fake tab" present '"ev":"auto-reset-stop"' "$last"
+has "...and stops there: this shell is no Claude Code" present "not this session" "$last"
+
+tab h2
+rows "$TMP/ar-h2/s-h2.jsonl" 262000 human:2
+fresh_handoff s-h2 258000
+stop_auto s-h2 "$(stop_json s-h2 "$TMP/ar-h2/s-h2.jsonl")" >/dev/null
+has "user typed 2m ago: no reset" absent '"sid":"s-h2","tokens"' \
+  "$(grep auto-reset-start "$CTX_STATE/handoff.jsonl")"
+
+tab h3
+rows "$TMP/ar-h3/s-h3.jsonl" 262000 human:40 note:1
+out=$(stop_auto s-h3 "$(stop_json s-h3 "$TMP/ar-h3/s-h3.jsonl" false 1)")
+is "alone, a shell running, no handoff: asks" ask "$out"
+has "...saying ctx types the /clear" present "ctx types /clear and 'continuando'" "$out"
+has "...and to name the running tasks" present "name each in the handoff" "$out"
+is "present, a shell running: quiet, as before" quiet \
+  "$(rows "$TMP/ar-h3/p.jsonl" 262000 human:1 && stop_auto s-h3p "$(stop_json s-h3p "$TMP/ar-h3/p.jsonl" false 1)")"
+cron_json=$(stop_json s-h4 "$TMP/ar-h3/s-h3.jsonl" | jq -c '.session_crons = [{id: "c1", schedule: "*/5 * * * *", recurring: true, prompt: "check"}]')
+is "alone, a wakeup scheduled: quiet" quiet "$(stop_auto s-h4 "$cron_json")"
+out=$(stop_auto s-h5 "$(stop_json s-h5 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CODE_ENTRYPOINT=sdk-cli)
+has "claude -p: the ask without the reset" absent "ctx types" "$out"
+out=$(stop_auto s-h6 "$(stop_json s-h6 "$TMP/ar-h3/s-h3.jsonl")" KONSOLE_DBUS_SESSION=)
+has "outside Konsole: the ask without the reset" absent "ctx types" "$out"
+out=$(stop_auto s-h7 "$(stop_json s-h7 "$TMP/ar-h3/s-h3.jsonl")" CTX_AUTO_RESET_IDLE=0)
+has "CTX_AUTO_RESET_IDLE=0: the ask without the reset" absent "ctx types" "$out"
+transcript "$TMP/ar-h3/old.jsonl" 262000
+out=$(stop_auto s-h8 "$(stop_json s-h8 "$TMP/ar-h3/old.jsonl")")
+has "no origin in the transcript: never alone" absent "ctx types" "$out"
 
 # --- cold return (UserPromptSubmit) -------------------------------------------------
 # A prompt that comes back to a big session past the cache's hour is stopped
