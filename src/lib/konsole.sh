@@ -18,6 +18,10 @@
 #    approves the call. Hence ctx_screen_idle before every keystroke.
 #  - a prompt typed this way is recorded as the user's own (origin.kind
 #    "human", promptSource "typed").
+#  - at a turn's end, Claude Code may show a prompt suggestion in the input
+#    box, which reads on screen exactly like text the user typed: the screen
+#    carries no colours. Typing replaces a suggestion, and adds to the user's
+#    text (ekko gotcha 784). Hence ctx_screen_idle --any.
 
 # ctx_konsole <method> [signature args...] -- a call on this tab's session
 # object; its reply on stdout.
@@ -51,16 +55,22 @@ ctx_konsole_type() {
   ctx_konsole sendText s $'\r' >/dev/null
 }
 
-# ctx_screen_idle [text] -- reads a Claude Code screen on stdin; succeeds only
-# when the session is idle and its input box holds exactly <text> (empty by
-# default): no dialog on screen, one line in the box, no spinner above it.
-# Prints why not. The spinner is not always right above the box: a hint line
-# ("◉ xhigh · /effort") or a tip can sit between them, so the three lines above
-# are searched. Claude Code writes U+00A0 after the prompt's "❯", not a space.
-# Byte for byte (LC_ALL=C), so that no locale changes what a character is: in
-# the build sandbox's C locale, ─{20,} repeated the rule's last byte only.
+# ctx_screen_idle [--any | text] -- reads a Claude Code screen on stdin;
+# succeeds only when the session is idle: no dialog on screen, one line in the
+# input box, at the prompt, no spinner above it. Its input box must hold
+# exactly <text> (empty by default, or the 'Try "..."' placeholder); with
+# --any, it may hold anything, and its text is printed: a prompt suggestion
+# and the user's own words look the same here, and only typing tells them
+# apart. Prints why not. The spinner is not always right above the box: a hint
+# line ("◉ xhigh · /effort") or a tip can sit between them, so the three lines
+# above are searched. Claude Code writes U+00A0 after the prompt's "❯", not a
+# space. Byte for byte (LC_ALL=C), so that no locale changes what a character
+# is: in the build sandbox's C locale, ─{20,} repeated the rule's last byte
+# only.
 ctx_screen_idle() {
-  LC_ALL=C sed 's/\xc2\xa0/ /g' | LC_ALL=C awk -v want="${1:-}" '
+  local any=0 want="${1:-}"
+  [ "$want" = --any ] && any=1 want=""
+  LC_ALL=C sed 's/\xc2\xa0/ /g' | LC_ALL=C awk -v want="$want" -v any="$any" '
     { sub(/[[:space:]]+$/, "") }
     NF == 0 { next }
     { line[++n] = $0 }
@@ -71,11 +81,13 @@ ctx_screen_idle() {
       if (s < 2) { print "no input box on screen"; exit 1 }
       top = sep[s - 1]; bottom = sep[s]
       if (bottom - top != 2) { print "the input box holds " bottom - top - 1 " lines"; exit 1 }
+      for (i = top - 1; i > 0 && i >= top - 3; i--)
+        if (line[i] ~ /^[^ ]+ [[:upper:]][[:alpha:]-]*…/) { print "busy: " line[i]; exit 1 }
       box = line[top + 1]
+      if (box !~ /^❯/) { print "no prompt in the input box: " box; exit 1 }
+      if (any) { sub(/^❯ ?/, "", box); print box; exit 0 }
       if (want == "") {
         if (box !~ /^❯ ?$/ && box !~ /^❯ Try "/) { print "text in the input box: " box; exit 1 }
       } else if (box != "❯ " want) { print "the input box holds: " box; exit 1 }
-      for (i = top - 1; i > 0 && i >= top - 3; i--)
-        if (line[i] ~ /^[^ ]+ [[:upper:]][[:alpha:]-]*…/) { print "busy: " line[i]; exit 1 }
     }'
 }

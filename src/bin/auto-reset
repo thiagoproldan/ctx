@@ -12,14 +12,17 @@
 # until someone typed /clear and 'continuando'. This types them, and nothing
 # else. Before each keystroke it checks that
 #  - the tab's foreground process is this session's Claude Code;
-#  - the screen shows the session idle, with its input box holding exactly
-#    what was typed so far (nothing, then /clear or the prompt): no dialog,
-#    where an Enter would approve a tool call, and no turn running;
+#  - the screen shows the session idle: no dialog, where an Enter would
+#    approve a tool call, and no turn running;
+#  - the input box held the same text for two readings in a row, and, once
+#    typed into, holds exactly what was typed. The text it held before may be
+#    a prompt suggestion, which typing replaces, or the user's own, which
+#    typing adds to: on screen the two look the same (ekko gotcha 784);
 #  - the user has typed nothing into the session since this started.
 # Anything else ends it, logged in handoff.jsonl as auto-reset-stop, taking
-# back with Ctrl+U what it typed itself. Each wait -- for the turn to end, for
-# the fresh session, for it to settle -- lasts up to CTX_AUTO_RESET_WAIT
-# seconds (300).
+# back what it typed itself, a backspace a character, when nothing else
+# changed. Each wait -- for the turn to end, for the fresh session, for it to
+# settle -- lasts up to CTX_AUTO_RESET_WAIT seconds (300).
 set -u
 
 [ "${CTX_DISABLE:-0}" = "1" ] && exit 0
@@ -69,36 +72,62 @@ typed_since() {
 }
 size() { stat -c %s -- "$1" 2>/dev/null || echo 0; }
 
-# settle <transcript> <offset> [text] -- wait, a second at a time, for two
-# readings in a row of the session idle with <text> in its input box, the tab
-# still Claude Code's and nothing typed by the user past <offset>.
+# settle <transcript> <offset> -- wait, a second at a time, for two readings in
+# a row of the session idle with the same text in its input box, the tab still
+# Claude Code's and nothing typed by the user past <offset>. That text goes in
+# $box, for press.
+box=""
 settle() {
-  local seen=0 why="it never read idle" deadline=$(($(date +%s) + wait_s))
+  local seen=0 now last="" why="it never read idle" deadline=$(($(date +%s) + wait_s))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     [ "$(ctx_konsole_foreground)" = "$claude" ] || stop "the tab's foreground process changed"
     [ "$(typed_since "$1" "$2")" = "true" ] && stop "the user typed into the session"
-    if why=$(ctx_konsole_screen | ctx_screen_idle "${3:-}"); then
-      seen=$((seen + 1))
-      [ "$seen" -ge 2 ] && return 0
+    if now=$(ctx_konsole_screen | ctx_screen_idle --any); then
+      if [ "$seen" -eq 1 ] && [ "$now" = "$last" ]; then
+        box=$now
+        return 0
+      fi
       why="idle once, not twice in a row"
+      [ "$seen" -eq 1 ] && why="the input box changed between readings"
+      seen=1 last=$now
     else
-      seen=0
+      seen=0 why=$now
     fi
     sleep 1
   done
   stop "not idle within ${wait_s}s: $why"
 }
 
-# press <text> -- type <text>, check that the box holds exactly it, then Enter.
+# holds_typed <after> <text> <before> -- <after> is <before> with <text> typed
+# in at one place, trailing blanks aside: nothing else changed.
+holds_typed() {
+  jq -en --arg a "$1" --arg t "$2" --arg b "$3" '
+    ($t | length) as $n | ($b | sub("\\s+$"; "")) as $b
+    | any(range(0; ($a | length) - $n + 1);
+        . as $i | $a[$i:$i + $n] == $t and (($a[:$i] + $a[$i + $n:]) | sub("\\s+$"; "")) == $b)
+  ' >/dev/null 2>&1
+}
+
+# press <text> -- type <text>; if the box then holds exactly it, Enter. A box
+# holding more held the user's own words, not a suggestion: what was typed is
+# taken back, a backspace a character, if nothing else changed there.
 press() {
-  local why
+  local why after n
   ctx_konsole sendText s "$1" >/dev/null || stop "sendText refused"
   sleep 0.5
-  if ! why=$(ctx_konsole_screen | ctx_screen_idle "$1"); then
-    ctx_konsole sendText s $'\x15' >/dev/null
-    stop "after typing '$1': $why"
+  if why=$(ctx_konsole_screen | ctx_screen_idle "$1"); then
+    ctx_konsole sendText s $'\r' >/dev/null || stop "sendText refused"
+    return 0
   fi
-  ctx_konsole sendText s $'\r' >/dev/null || stop "sendText refused"
+  if after=$(ctx_konsole_screen | ctx_screen_idle --any) && holds_typed "$after" "$1" "$box"; then
+    n=$(jq -rn --arg t "$1" '$t | length')
+    for _ in $(seq 1 "$n"); do
+      ctx_konsole sendText s $'\x7f' >/dev/null
+      sleep 0.15
+    done
+    stop "after typing '$1': $why; taken back"
+  fi
+  stop "after typing '$1': $why; left as it was"
 }
 
 step=clear

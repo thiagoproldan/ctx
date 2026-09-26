@@ -190,12 +190,21 @@ monitor or a subagent is pending: none was tried across a `/clear`.
 Before each keystroke, `bin/auto-reset` checks that the tab's foreground
 process is this session's Claude Code, that the user has typed nothing since
 it started, and that the screen (`getAllDisplayedText`) shows the session
-idle with its input box holding exactly what it typed so far. A permission
-dialog opens with `1. Yes` selected, so an Enter typed into one would approve
-the call. What was measured on 2026-09-26 (Claude Code 2.1.283) shaped the
-rest: a long text sent with its Enter in one `sendText` is taken as a paste,
-and the Enter becomes a newline, so each Enter goes alone, half a second
-later. A prompt typed this way is recorded as the user's own, so the rows ctx
+idle, with no dialog: a permission dialog opens with `1. Yes` selected, so an
+Enter typed into one would approve the call. What was measured on 2026-09-26
+(Claude Code 2.1.283) shaped the rest:
+
+- At a turn's end, Claude Code may show a prompt suggestion in the input box,
+  on by default (`promptSuggestionEnabled`), and on screen it reads exactly
+  like text the user typed. Typing tells them apart: it replaces a
+  suggestion, and adds to the user's text. So the box may hold any text that
+  stays the same for two readings in a row; once typed into, it must hold
+  exactly what was typed, or what was typed is taken back, a backspace a
+  character, when nothing else changed there, and the reset stops.
+- A long text sent with its Enter in one `sendText` is taken as a paste, and
+  the Enter becomes a newline, so each Enter goes alone, half a second later.
+
+A prompt typed this way is recorded as the user's own, so the rows ctx
 typed are listed in `$CTX_STATE/auto/<session>.typed` and passed over when
 presence is read. The 5-hour trigger never resets: a reset spends the window,
 it does not spare it.

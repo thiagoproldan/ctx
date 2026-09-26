@@ -600,9 +600,11 @@ eq() {
 . "$ROOT/lib/handoff.sh"
 SCREENS="$ROOT/test-data/screens"
 
-# The guard, on six screens captured live on 2026-09-26: only an idle session
-# with an empty box may be typed into. busy2 has a hint line between the
-# spinner and the box, busy3 a tip: the first guard read those as idle.
+# The guard, on six screens captured live on 2026-09-26. busy2 has a hint line
+# between the spinner and the box, busy3 a tip: the first guard read those as
+# idle. With --any, text in the box is no reason to wait: a prompt suggestion
+# looks the same as the user's own words (ekko gotcha 784), and only typing
+# tells them apart.
 guard() { ctx_screen_idle "${2:-}" <"$SCREENS/$1.txt" >/dev/null && echo types || echo waits; }
 eq "idle, empty box" types "$(guard idle)"
 eq "busy" waits "$(guard busy)"
@@ -615,6 +617,13 @@ RULE="────────────────────────�
 typed_screen() { printf '✻ Crunched for 1s · done\n%s\n❯\xc2\xa0%s\n%s\n  ctx 15k\n' "$RULE" "$1" "$RULE"; }
 eq "/clear typed, /clear expected" types "$(typed_screen /clear | ctx_screen_idle /clear >/dev/null && echo types || echo waits)"
 eq "/clear typed after the user's text" waits "$(typed_screen 'abc/clear' | ctx_screen_idle /clear >/dev/null && echo types || echo waits)"
+eq "--any, idle: an empty box" "" "$(ctx_screen_idle --any <"$SCREENS/idle.txt")"
+eq "--any, text in the box: the text" "meio digitado" "$(ctx_screen_idle --any <"$SCREENS/text.txt")"
+for s in busy busy2 busy3 dialog; do
+  eq "--any, $s" waits "$(ctx_screen_idle --any <"$SCREENS/$s.txt" >/dev/null && echo types || echo waits)"
+done
+eq "--any, a box not at the ❯ prompt" waits \
+  "$(printf '✻ Crunched for 1s · done\n%s\n! ls\n%s\n  ctx 15k\n' "$RULE" "$RULE" | ctx_screen_idle --any >/dev/null && echo types || echo waits)"
 
 # rows <file> <tokens> <row>... -- a transcript: each row human:<minutes ago>[:uuid]
 # or note:<minutes ago> (a background task's notification), then a
@@ -643,7 +652,10 @@ transcript "$TMP/p3.jsonl" 1000
 eq "no origin on any row: unknown, never away" unknown "$(ago "$TMP/p3.jsonl")"
 
 # The fake tab. State in $FK: box (the input box), sent (each sendText, %q),
-# current (the transcript an Enter appends to), and flags deny, busy, dialog.
+# current (the transcript an Enter appends to), suggest (a prompt suggestion,
+# shown while the box is empty, as Claude Code does), and flags deny, busy,
+# dialog, meddle (the user types a 'u' after each text ctx types) and restless
+# (the box changes at every reading).
 FAKEBIN="$TMP/fakebin"
 mkdir -p "$FAKEBIN"
 cat >"$FAKEBIN/busctl" <<EOF
@@ -659,12 +671,19 @@ done
 render() {
   if [ -e "\$F/dialog" ]; then cat "$SCREENS/dialog.txt"
   elif [ -e "\$F/busy" ]; then cat "$SCREENS/busy.txt"
-  else printf '✻ Crunched for 1s · done\n%s\n❯\xc2\xa0%s\n%s\n  ctx 15k\n' "$RULE" "\$(cat "\$F/box")" "$RULE"
+  else printf '✻ Crunched for 1s · done\n%s\n❯\xc2\xa0%s\n%s\n  ctx 15k\n' "$RULE" "\$(shown)" "$RULE"
+  fi
+}
+shown() {
+  if [ -s "\$F/box" ]; then cat "\$F/box"
+  elif [ -e "\$F/suggest" ]; then cat "\$F/suggest"
   fi
 }
 case "\${args[4]}" in
   foregroundProcessId) echo "i \$(cat "\$F/fg")" ;;
-  getAllDisplayedText) render | jq -Rsc '{type: "s", data: [.]}' ;;
+  getAllDisplayedText)
+    [ -e "\$F/restless" ] && printf . >>"\$F/box"
+    render | jq -Rsc '{type: "s", data: [.]}' ;;
   sendText)
     [ -e "\$F/deny" ] && { echo "Call failed: Access denied" >&2; exit 1; }
     # Another session of the same project, busy all along.
@@ -674,6 +693,7 @@ case "\${args[4]}" in
     case "\$t" in
       '') ;;
       \$'\x15') : >"\$F/box" ;;
+      \$'\x7f') b=\$(cat "\$F/box"); printf '%s' "\${b%?}" >"\$F/box" ;;
       \$'\r')
         b=\$(cat "\$F/box"); : >"\$F/box"
         if [ "\$b" = /clear ]; then
@@ -684,7 +704,8 @@ case "\${args[4]}" in
           jq -nc --arg c "\$b" '{type: "user", uuid: "typed-row", origin: {kind: "human"},
             timestamp: (now | todate), message: {content: \$c}}' >>"\$(cat "\$F/current")"
         fi ;;
-      *) printf '%s' "\$t" >>"\$F/box" ;;
+      *) printf '%s' "\$t" >>"\$F/box"
+        if [ -e "\$F/meddle" ]; then printf u >>"\$F/box"; fi ;;
     esac ;;
   *) exit 1 ;;
 esac
@@ -744,11 +765,37 @@ for state in dialog busy; do
 done
 has "...the dialog is why" present "a dialog is open" "$(said s-a-dialog)"
 
+# Text in the box may be a prompt suggestion, which typing replaces, or the
+# user's own, which typing adds to: /clear is typed, and taken back when the
+# box then holds more.
+bs6=$(for _ in 1 2 3 4 5 6; do printf '%q ' $'\x7f'; done)
 tab a4
 printf 'meio digitado' >"$FK/box"
 rows "$TMP/ar-a4/s-a4.jsonl" 300000 human:40
 WAIT=3 reset_env "$AR" s-a4 "$TMP/ar-a4/s-a4.jsonl" $$
-eq "the user's half-typed text: left alone" "'' " "$(sent)"
+eq "the user's half-typed text: /clear, taken back" "'' /clear $bs6" "$(sent)"
+eq "...the box as it was" "meio digitado" "$(cat "$FK/box")"
+has "...logged" present "taken back" "$(said s-a4)"
+
+tab a6
+printf 'roda em segundo plano' >"$FK/suggest"
+rows "$TMP/ar-a6/s-a6.jsonl" 300000 human:40
+reset_env "$AR" s-a6 "$TMP/ar-a6/s-a6.jsonl" $$
+eq "a prompt suggestion in the box: typed over" "'' /clear \$'\\r' continuando \$'\\r' " "$(sent)"
+has "...and the reset logged" present '"ev":"auto-reset","sid":"s-a6"' "$(said s-a6)"
+
+tab a7 meddle
+printf 'meio digitado' >"$FK/box"
+rows "$TMP/ar-a7/s-a7.jsonl" 300000 human:40
+WAIT=3 reset_env "$AR" s-a7 "$TMP/ar-a7/s-a7.jsonl" $$
+eq "the user types as ctx types: nothing taken back" "'' /clear " "$(sent)"
+has "...logged" present "left as it was" "$(said s-a7)"
+
+tab a8 restless
+rows "$TMP/ar-a8/s-a8.jsonl" 300000 human:40
+WAIT=3 reset_env "$AR" s-a8 "$TMP/ar-a8/s-a8.jsonl" $$
+eq "the box changes at every reading: nothing typed" "'' " "$(sent)"
+has "...logged" present "changed between readings" "$(said s-a8)"
 
 tab a5 busy
 rows "$TMP/ar-a5/s-a5.jsonl" 300000 human:40
