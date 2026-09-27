@@ -991,6 +991,7 @@ g add -A && g commit -q -m first && g remote add origin "$WL/remote.git" && g pu
 wl "reset --hard, clean tree" allow 'git reset --hard'
 printf 'changed\n' >"$WL/repo/a.txt"
 wl "reset --hard, a.txt changed" deny 'git reset --hard'
+wl "a stray = before it, which broke the lexer" deny '= y; git reset --hard'
 wl "checkout -- a.txt, changed" deny 'git checkout -- a.txt'
 wl "checkout -- b.txt, unchanged" allow 'git checkout -- b.txt'
 wl "checkout HEAD a.txt, no --" deny 'git checkout HEAD a.txt'
@@ -1061,6 +1062,138 @@ wl "rm -rf .git, pushed and clean" allow 'rm -rf .git'
 has "a refusal goes to guard.jsonl" present '"ev": "guard-refuse"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 has "a pass goes to guard.jsonl" present '"ev": "guard-pass"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 unset CTX_GUARD_SCRATCH GD
+
+# --- secrets guard (PreToolUse on Read, Grep and Bash) ------------------------------
+# Each rule against a file that is secret and one that is not, and each command
+# that prints a secret with its output shown and sent elsewhere. HOME and the
+# secret roots move into $TMP, so nothing real is read.
+echo "secrets guard (PreToolUse on Read, Grep and Bash):"
+SEC="$TMP/sec"
+SH="$SEC/home"
+mkdir -p "$SH/.ssh" "$SH/.claude-x" "$SH/.config/gh" "$SEC/persist" "$SEC/plain" "$SEC/repo/src" "$SEC/repo/keys"
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n' >"$SH/.ssh/id_ed25519"
+echo 'ssh-ed25519 AAAA fake' >"$SH/.ssh/id_ed25519.pub" && echo 'Host x' >"$SH/.ssh/config"
+echo '{"claudeAiOauth":{}}' >"$SH/.claude-x/.credentials.json" && echo '{}' >"$SH/.claude-x/settings.json"
+echo 'github.com: {oauth_token: fake}' >"$SH/.config/gh/hosts.yml"
+echo 'machine x login y password z' >"$SH/.netrc"
+echo 'fake' >"$SEC/persist/github-token"
+echo 'KEY=1' >"$SEC/plain/.env.local"
+git init -q -b main "$SEC/repo"
+printf '.env\n' >"$SEC/repo/.gitignore" && echo 'TEMPLATE=1' >"$SEC/repo/.env.development"
+echo 'const x = 1' >"$SEC/repo/src/app.ts"
+GD="$SEC/repo" g add -A && GD="$SEC/repo" g commit -q -m first
+echo 'API_KEY=fake' >"$SEC/repo/.env" && echo 'API_KEY=' >"$SEC/repo/.env.example"
+echo 'AGE-SECRET-KEY-1FAKE' >"$SEC/repo/keys/age-combined-identity.txt"
+
+sec_read() { jq -nc --arg p "$1" --arg d "$SEC/repo" '{tool_name:"Read",tool_input:{file_path:$p},cwd:$d,session_id:"suite"}'; }
+sec_grep() {
+  jq -nc --arg p "$1" --arg m "$2" --arg g "${3:-}" --arg d "$SEC/repo" \
+    '{tool_name:"Grep",tool_input:({pattern:"KEY",path:$p,output_mode:$m} + if $g == "" then {} else {glob:$g} end),cwd:$d,session_id:"suite"}'
+}
+sec_bash() { jq -nc --arg c "$1" --arg d "${2:-$SEC/repo}" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d,session_id:"suite"}'; }
+sg() { HOME="$SH" CTX_SECRET_ROOTS="$SEC/persist" check "$1" "$2" guard-secrets "$3"; }
+sb() { sg "$1" "$2" "$(sec_bash "$3" "${4:-}")"; }
+
+sg "Read an SSH private key" deny "$(sec_read "$SH/.ssh/id_ed25519")"
+sg "Read its public half" allow "$(sec_read "$SH/.ssh/id_ed25519.pub")"
+sg "Read ~/.ssh/config" allow "$(sec_read "$SH/.ssh/config")"
+sg "Read a file under a secret root" deny "$(sec_read "$SEC/persist/github-token")"
+sg "Read Claude Code's .credentials.json" deny "$(sec_read "$SH/.claude-x/.credentials.json")"
+sg "Read Claude Code's settings.json" allow "$(sec_read "$SH/.claude-x/settings.json")"
+sg "Read gh's hosts.yml" deny "$(sec_read "$SH/.config/gh/hosts.yml")"
+sg "Read ~/.netrc" deny "$(sec_read "$SH/.netrc")"
+sg "Read an age identity" deny "$(sec_read "$SEC/repo/keys/age-combined-identity.txt")"
+sg "Read an untracked, ignored .env" deny "$(sec_read "$SEC/repo/.env")"
+sg "Read a tracked .env.development" allow "$(sec_read "$SEC/repo/.env.development")"
+sg "Read an untracked .env.example" allow "$(sec_read "$SEC/repo/.env.example")"
+sg "Read a .env.local outside any repository" deny "$(sec_read "$SEC/plain/.env.local")"
+sg "Read a source file" allow "$(sec_read "$SEC/repo/src/app.ts")"
+
+sg "Grep content over a folder holding a .env" deny "$(sec_grep "$SEC/repo" content)"
+sg "Grep files_with_matches over it" allow "$(sec_grep "$SEC/repo" files_with_matches)"
+sg "Grep content, glob *.ts" allow "$(sec_grep "$SEC/repo" content '*.ts')"
+sg "Grep content of the .env itself" deny "$(sec_grep "$SEC/repo/.env" content)"
+
+sb "cat .env" deny 'cat .env'
+sb "cat .env.development, tracked" allow 'cat .env.development'
+sb "cat .env > file" allow 'cat .env > /dev/null'
+sb "ls, stat, test -e, wc -l on it" allow 'ls -la .env* && stat .env && test -e .env && wc -l .env'
+sb "grep -c KEY .env" allow 'grep -c KEY .env'
+sb "grep KEY .env" deny 'grep KEY .env'
+sb "grep -rn KEY ." deny 'grep -rn KEY .'
+sb "grep -rn KEY, no path" deny 'grep -rn KEY'
+sb "grep -rn --include=*.ts KEY ." allow "grep -rn --include='*.ts' KEY ."
+sb "grep -rn KEY src" allow 'grep -rn KEY src'
+sb "grep -rn over it, matching nothing in .env" allow 'grep -rn "const x" .'
+sb "grep -oE names only from .env" allow "grep -oE '^[A-Z_]+=' .env"
+sb "grep -E a name and its value from .env" deny "grep -E '^API_KEY=' .env"
+sb "grep -v, every other line of .env" deny "grep -v '^#' .env"
+sb "grep -E matching nothing in .env" allow "grep -E '^MISSING=' .env"
+sb "rg KEY: hidden files skipped" allow 'rg KEY'
+sb "rg --hidden KEY" deny 'rg --hidden KEY'
+sb "rg KEY .env, named" deny 'rg KEY .env'
+sb "grep for the words /persist/secrets" allow "grep -rn $SEC/persist src"
+sb "sed -n 1p .env" deny 'sed -n 1p .env'
+sb "sed -i on .env" allow "sed -i 's/1/2/' .env"
+sb "jq on .credentials.json" deny 'jq . ~/.claude-x/.credentials.json'
+sb "jq's .env filter on settings.json" allow "jq '.env.X' ~/.claude-x/settings.json"
+sb "cat < ~/.netrc" deny 'cat < ~/.netrc'
+sb "cat .env | wc -l: a pipe counts as shown" deny 'cat .env | wc -l'
+sb "cat .env | wc -l > file" allow 'cat .env | wc -l > /dev/null'
+sb "bash -c 'cat .env'" deny "bash -c 'cat .env'"
+sb "bash -c 'cat .env' > file" allow "bash -c 'cat .env' > /dev/null"
+sb "echo names it" allow 'echo "cat .env"'
+sb "a stray = before it" deny '= y; cat .env'
+sb "an escaped backtick inside quotes" allow 'grep -rnoE "a[\`]b" src'
+sb "a here-document names it" allow "$(printf 'cat <<EOF\ncat .env\nEOF')"
+sb "sourcing .env" allow '. ./.env && true'
+sb "diff <(cat .env) .env.example" deny 'diff <(cat .env) .env.example'
+sb "diff -q .env .env.example" allow 'diff -q .env .env.example'
+sb "cd ~/.ssh && cat id_ed25519" deny 'cd ~/.ssh && cat id_ed25519'
+sb "cat ~/.ssh/*.pub" allow 'cat ~/.ssh/*.pub'
+sb "cat ~/.ssh/*" deny 'cat ~/.ssh/*'
+sb "grep -r over the home folder" deny 'grep -r token ~'
+sb "rg over the home folder: hidden skipped" allow 'rg token ~'
+sb "openssl pkey -in a private key" deny 'openssl pkey -in ~/.ssh/id_ed25519'
+sb "dd if=.env" deny 'dd if=.env'
+sb "cat under a secret root" deny "cat $SEC/persist/github-token"
+sb "ls a secret root" allow "ls -la $SEC/persist"
+sb "bwrap --tmpfs over a secret root" allow "bwrap --tmpfs $SEC/persist --ro-bind / / true"
+
+# Every reader in READERS, on the untracked .env; API is the pattern, script or
+# filter for the ones that take one first, and a missing file for the rest.
+readers=$(python3 -c "import sys; sys.path.insert(0, '$HOOKS/../lib'); import guard_secrets as g; print(' '.join(sorted(g.READERS - {'dd', 'openssl'})))")
+missed=""
+for r in $readers; do
+  out=$(sec_bash "$r API .env" | HOME="$SH" CTX_SECRET_ROOTS="$SEC/persist" env -u CTX_DISABLE "$HOOKS/guard-secrets")
+  [ "$(verdict "$out")" = deny ] || missed+=" $r"
+done
+has "every reader in READERS refuses .env ($(wc -w <<<"$readers"))" absent " " "$missed"
+
+sb "gh auth token" deny 'gh auth token'
+sb "gh auth token inside \$(...)" allow 'NIX_CONFIG="access-tokens = github.com=$(gh auth token)" nix flake update x'
+sb "gh auth token > file" allow 'gh auth token > /dev/null'
+sb "gh auth status" allow 'gh auth status'
+sb "gh auth status --show-token" deny 'gh auth status --show-token'
+sb "sops -d" deny 'sops -d secrets.yaml'
+sb "sops -d --output" allow 'sops -d --output out.yaml secrets.yaml'
+sb "sops -e" allow 'sops -e plain.yaml'
+sb "age -d" deny 'age -d -i key.txt f.age'
+sb "age -d -o" allow 'age -d -i key.txt -o out f.age'
+sb "gpg -d" deny 'gpg -d f.gpg'
+sb "gpg --export-secret-keys -o" allow 'gpg --export-secret-keys -o out.asc'
+sb "secret-tool lookup" deny 'secret-tool lookup service x'
+sb "secret-tool store" allow 'secret-tool store --label=x service x'
+sb "kwallet-query -r" deny 'kwallet-query -r x kdewallet'
+sb "kwallet-query -l" allow 'kwallet-query -l kdewallet'
+sb "pass show" deny 'pass show email/x'
+sb "pass, a bare name" deny 'pass email/x'
+sb "pass show -c" allow 'pass show -c email/x'
+sb "pass ls" allow 'pass ls'
+sb "git credential fill" deny "printf 'host=github.com\\n' | git credential fill"
+sb "a commit message names gh auth token" allow 'git commit -q --allow-empty -m "gh auth token"'
+has "a refusal goes to guard.jsonl" present '"ev": "secret-refuse"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+has "a secret sent to a file goes to guard.jsonl" present '"ev": "secret-pass"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 
 # --- live: the worker ---------------------------------------------------------------
 # Not hermetic (needs the worker signed in via ctx-login, and the network), so

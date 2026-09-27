@@ -35,6 +35,9 @@ plugin, the same way ekko is.
    - `guard-work-loss` — `PreToolUse` on `Bash`: denies a git or `rm -r` call
      only when it would destroy work that exists nowhere else, and says what
      (see _The work-loss guard_).
+   - `guard-secrets` — `PreToolUse` on `Read`, `Grep` and `Bash`: denies a call
+     that would bring secret material into the context, and says what (see
+     _The secrets guard_).
    - `announce-graph` — `SessionStart`: if the project has a graphify index, say
      so on turn zero.
    - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
@@ -246,6 +249,49 @@ not a hijacked agent: a hook sees only the literal call. Any error in the guard
 lets the call through. Every call it examines, refused or not, goes to
 `$CTX_STATE/guard.jsonl`.
 
+## The secrets guard
+
+`guard-secrets` refuses a call that would print a secret into the context.
+A file is secret by where it is and what it holds, not by the command that
+names it:
+
+- anything under the secret roots (`CTX_SECRET_ROOTS`: `/persist/secrets`,
+  `/run/secrets` and `/run/secrets.d`);
+- an age key (`age-combined-identity.txt`, `sops/age/keys.txt`,
+  `$SOPS_AGE_KEY_FILE`), and a private key under `~/.ssh`, told by its first
+  line;
+- Claude Code's `~/.claude*/.credentials.json`, gh's `hosts.yml`, git's stored
+  credentials and `~/.netrc`;
+- a `.env` or `.env.*` git does not track, bar the templates (`.example`,
+  `.sample`, `.template`, `.dist`).
+
+It refuses a `Read` of one, a `Grep` that shows its lines, and a Bash call that
+prints what it reads (`cat`, `grep`, `jq`, `sed`, `head` and 45 more) naming
+one, fed one by `<`, or searching a folder that holds one. It also refuses the
+commands that print a secret of their own: `gh auth token`,
+`gh auth status --show-token`, `sops -d`, `age -d`, `gpg -d`,
+`secret-tool lookup`, `kwallet-query -r`, `pass show` and
+`git credential fill`. Unless the output goes to a file or into `$(...)`, so
+`NIX_CONFIG="access-tokens = github.com=$(gh auth token)" nix flake update`
+passes. A pipe counts as shown unless the pipeline ends in a file. Metadata
+passes: `ls`, `stat`, `test -e`, `wc`, and `grep -c`, `-l` or `-q`.
+
+A grep-like search prints only what it matches, so the guard runs the call's
+own pattern on the secret file, with the output kept out of the context, and
+refuses only if it would print something: from a `.env`, a value, not just
+names (`grep -oE '^[A-Z_]+='` passes). Replayed over this machine's 21,842
+Bash and 1,633 Read calls from 2026-08-04 to 2026-09-27 (UTC), against the
+disk as it is now, it refuses 6: three would have printed a database URI or a
+password from a `.env`, three a flag's value from a `.env.local`. The first
+draft refused 20: five were a lexer defect that lost a search's path, and nine
+searches that match no value in those files.
+
+Not guarded: what a sourced `.env` puts in the environment and a later call
+prints, a script the command runs, and a copy made in one call and read in
+another. Any error in the guard lets the call through. Each refusal, and each
+call that named a secret but sent it elsewhere, goes to
+`$CTX_STATE/guard.jsonl`.
+
 ## The worker: Gemini through `agy`, sandboxed
 
 Upstream talks to AiKA Modes via `portal-cli` (Gemini 2.5 Flash), Spotify-internal
@@ -409,6 +455,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_AUTO_RESET_PROMPT` | `continuando`             | Auto reset: what it types into the fresh session                   |
 | `CTX_AUTO_RESET_WAIT`   | `300`                     | Auto reset: seconds each wait lasts before it gives up             |
 | `CTX_GUARD_SCRATCH`     | `/tmp:/var/tmp:…`         | Work-loss guard: colon-separated roots it never guards             |
+| `CTX_SECRET_ROOTS`      | `/persist/secrets:…`      | Secrets guard: colon-separated roots whose every file is secret    |
 
 ## Moving from shunt
 

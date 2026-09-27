@@ -20,18 +20,14 @@ command runs, whose calls the hook never sees.
 Each call it examines goes to $CTX_STATE/guard.jsonl, refused or not.
 """
 
-import datetime
-import glob
 import json
 import os
-import re
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shell_calls import calls  # noqa: E402
+from guards import HOME, deny, git, log, under  # noqa: E402
+from shell_calls import expand, letters, located, operands  # noqa: E402
 
-HOME = os.path.expanduser("~")
 SAVING_STASH = {None, "push", "save"}
 SHOWN = 5  # paths named in a reason; the rest are counted
 # What a rule returns for a call whose form cannot lose work: not examined.
@@ -45,25 +41,6 @@ def scratch_roots():
             ["/tmp", "/var/tmp", os.environ.get("XDG_RUNTIME_DIR", ""), HOME + "/.cache"]
         )
     return [os.path.realpath(root) for root in value.split(":") if root]
-
-
-def under(path, roots):
-    return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
-
-
-def git(where, *args, stdin=None):
-    """git's stdout, or None when it fails or cannot run."""
-    try:
-        done = subprocess.run(
-            ["git", "-C", where, *args],
-            input=stdin,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return done.stdout if done.returncode == 0 else None
 
 
 def toplevel(where):
@@ -83,32 +60,6 @@ def porcelain(where, *args):
     if not out:
         return []
     return [line[3:].split(" -> ")[-1] for line in out.splitlines() if len(line) > 3]
-
-
-def letters(args):
-    """The short options' letters, up to --."""
-    found = set()
-    for arg in args:
-        if arg == "--":
-            break
-        if arg.startswith("-") and not arg.startswith("--"):
-            found |= set(arg[1:])
-    return found
-
-
-def operands(args, valued=()):
-    """The arguments that are not options, skipping the values `valued` take."""
-    found, skip, dashes = [], False, False
-    for arg in args:
-        if skip:
-            skip = False
-        elif dashes or not arg.startswith("-") or arg == "-":
-            found.append(arg)
-        elif arg == "--":
-            dashes = True
-        elif arg in valued:
-            skip = True
-    return found
 
 
 def after_dashes(args):
@@ -393,30 +344,6 @@ def remove(where, args, variables, scratch):
 # --- walking the command -------------------------------------------------------
 
 
-def expand(word, variables, where):
-    """The paths a word names, or [] when it names one the hook cannot know."""
-    if word.startswith("~"):
-        word = HOME + word[1:]
-
-    def value(match):
-        name = match.group(1) or match.group(2)
-        found = variables.get(name, os.environ.get(name))
-        if found is None:
-            raise KeyError(name)
-        return found
-
-    try:
-        word = re.sub(r"\$\{(\w+)\}|\$(\w+)", value, word)
-    except KeyError:
-        return []
-    if "$" in word or "`" in word:
-        return []
-    path = os.path.join(where, word)
-    if any(char in word for char in "*?["):
-        return glob.glob(path)
-    return [path]
-
-
 def git_call(args, where):
     """git's own options, then the subcommand and its args, and the folder
     the subcommand runs in."""
@@ -438,21 +365,9 @@ def git_call(args, where):
 def verdict(command, cwd, scratch):
     """(rule, call, loss, keep) for the first call that would lose work, and
     the list of calls examined."""
-    where, variables, saved, examined = cwd, {}, set(), []
-    for name, args in calls(command):
-        if name == "=":
-            variables[args[0]] = args[1]
-        elif name in ("export", "local", "declare", "readonly"):
-            for arg in args:
-                if "=" in arg and not arg.startswith("-"):
-                    key, val = arg.split("=", 1)
-                    variables[key] = val
-        elif name in ("cd", "pushd"):
-            target = operands(args)
-            paths = expand(target[0], variables, where) if target else [HOME]
-            if len(paths) == 1 and os.path.isdir(paths[0]):
-                where = os.path.realpath(paths[0])
-        elif name == "git":
+    saved, examined = set(), []
+    for (name, args), where, variables in located(command, cwd):
+        if name == "git":
             sub, rest, here = git_call(args, where)
             if sub is None or not os.path.isdir(here):
                 continue
@@ -499,28 +414,6 @@ def verdict(command, cwd, scratch):
     return None, examined
 
 
-def log(event, sid, rule, call, where, loss=""):
-    state = os.environ.get("CTX_STATE") or os.path.join(
-        os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "ctx"
-    )
-    line = {
-        "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "ev": event,
-        "sid": sid,
-        "rule": rule,
-        "cwd": where,
-        "call": call[:300],
-    }
-    if loss:
-        line["loss"] = loss[:500]
-    try:
-        os.makedirs(state, exist_ok=True)
-        with open(os.path.join(state, "guard.jsonl"), "a") as ledger:
-            ledger.write(json.dumps(line) + "\n")
-    except OSError:
-        pass  # a lost measurement, never a stuck session
-
-
 def main():
     event = json.load(sys.stdin)
     command = (event.get("tool_input") or {}).get("command") or ""
@@ -538,17 +431,7 @@ def main():
         f"ctx's work-loss guard refused `{call[:200]}` in {where}: it would destroy {loss}. "
         f"That work exists nowhere else. {keep}"
     )
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+    deny(reason)
 
 
 if __name__ == "__main__":
