@@ -9,6 +9,7 @@
   coreutils,
   findutils,
   gawk,
+  git,
   gnugrep,
   gnused,
   jq,
@@ -27,6 +28,7 @@ let
     coreutils
     findutils
     gawk
+    git # hooks/guard-work-loss reads each repository's state
     gnugrep
     gnused
     jq
@@ -38,7 +40,7 @@ let
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "ctx";
-  version = "0.4.1";
+  version = "0.5.0";
 
   src = ./src;
 

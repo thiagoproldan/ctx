@@ -972,6 +972,96 @@ out=$(
 has "malformed input: exit 0" present "rc=0" "$out"
 has "malformed input: nothing printed" absent "{" "$out"
 
+# --- work-loss guard (PreToolUse on Bash) -------------------------------------------
+# Each rule runs against a repository state that would lose work and one that
+# would not: a guard that refuses on the command's name alone fails here. $TMP
+# is under /tmp, a scratch root, so the scratch roots move elsewhere for these.
+echo "work-loss guard (PreToolUse on Bash):"
+WL="$TMP/wl"
+export CTX_GUARD_SCRATCH="$TMP/scratch"
+wl_json() { jq -nc --arg c "$1" --arg d "${2:-$WL/repo}" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d,session_id:"suite"}'; }
+g() { git -C "${GD:-$WL/repo}" -c user.name=suite -c user.email=suite@ctx "$@" >/dev/null 2>&1; }
+wl() { check "$1" "$2" guard-work-loss "$(wl_json "$3" "${4:-}")"; }
+mkdir -p "$WL" "$TMP/scratch" "$TMP/plain" && echo x >"$TMP/plain/x"
+git init -q --bare -b main "$WL/remote.git"
+git init -q -b main "$WL/repo"
+printf 'one\n' >"$WL/repo/a.txt" && printf 'two\n' >"$WL/repo/b.txt" && printf 'build/\n' >"$WL/repo/.gitignore"
+g add -A && g commit -q -m first && g remote add origin "$WL/remote.git" && g push -q -u origin main && g remote set-head origin main
+
+wl "reset --hard, clean tree" allow 'git reset --hard'
+printf 'changed\n' >"$WL/repo/a.txt"
+wl "reset --hard, a.txt changed" deny 'git reset --hard'
+wl "checkout -- a.txt, changed" deny 'git checkout -- a.txt'
+wl "checkout -- b.txt, unchanged" allow 'git checkout -- b.txt'
+wl "checkout HEAD a.txt, no --" deny 'git checkout HEAD a.txt'
+wl "checkout ." deny 'git checkout .'
+wl "checkout main, a switch" allow 'git checkout main'
+wl "restore a.txt" deny 'git restore a.txt'
+wl "restore --staged a.txt" allow 'git restore --staged a.txt'
+wl "switch --discard-changes" deny 'git switch --discard-changes main'
+wl "git rm -f a.txt" deny 'git rm -f a.txt'
+wl "git stash push -u, then reset: one command" allow 'git stash push -u && git reset --hard'
+wl "echo names it" allow 'echo "git reset --hard"'
+wl "a here-document names it" allow "$(printf 'cat <<EOF\ngit reset --hard\nEOF')"
+wl "bash -c" deny "bash -c 'git reset --hard'"
+wl "cd into the repository first" deny "cd $WL/repo && git reset --hard" "$TMP"
+wl "git -C the repository" deny "git -C $WL/repo reset --hard" "$TMP"
+CTX_GUARD_SCRATCH="$WL" wl "the repository under a scratch root" allow 'git reset --hard'
+g checkout -- a.txt
+
+printf 'x\n' >"$WL/repo/new.txt"
+wl "clean -fd, an untracked file" deny 'git clean -fd'
+wl "clean -nd, a dry run" allow 'git clean -nd'
+rm "$WL/repo/new.txt" && mkdir -p "$WL/repo/build" && echo o >"$WL/repo/build/out"
+wl "clean -fd, only ignored files" allow 'git clean -fd'
+wl "clean -fdx, ignored files" deny 'git clean -fdx'
+
+printf 'stashed\n' >"$WL/repo/b.txt" && g stash push -q -m keepme
+wl "stash drop, changes nowhere else" deny 'git stash drop'
+wl "stash clear, changes nowhere else" deny 'git stash clear'
+g stash apply -q
+wl "stash drop, changes in the work tree" allow 'git stash drop'
+g stash drop -q && g checkout -- b.txt
+
+g checkout -q -b feat && echo f >"$WL/repo/f.txt" && g add f.txt && g commit -q -m feat && g checkout -q main
+wl "branch -D, a commit only it has" deny 'git branch -D feat'
+wl "branch -d, git refuses itself" allow 'git branch -d feat'
+g push -q origin feat
+wl "branch -D, pushed" allow 'git branch -D feat'
+
+g worktree add -q "$WL/wt" -b wtb && echo w >"$WL/wt/w.txt"
+wl "worktree remove --force, an untracked file" deny "git worktree remove --force $WL/wt"
+rm "$WL/wt/w.txt"
+wl "worktree remove --force, clean" allow "git worktree remove --force $WL/wt"
+g worktree remove --force "$WL/wt"
+
+git clone -q "$WL/remote.git" "$WL/other" && GD="$WL/other" g commit -q --allow-empty -m theirs && GD="$WL/other" g push -q origin main && g fetch -q origin
+wl "push --force origin main, drops a remote commit" deny 'git push --force origin main'
+wl "push +main, the same" deny 'git push origin +main'
+wl "push --delete origin main" deny 'git push --delete origin main'
+wl "push --force-with-lease origin feat" allow 'git push --force-with-lease origin feat'
+wl "push origin main, no force" allow 'git push origin main'
+g merge -q --ff-only origin/main
+wl "push --force origin main, a fast-forward" allow 'git push --force origin main'
+
+mkdir -p "$WL/repo/sub" && echo u >"$WL/repo/sub/u.txt"
+wl "rm -rf a folder with an untracked file" deny 'rm -rf sub'
+wl "rm -rf an ignored build folder" allow 'rm -rf build'
+wl "rm -f a file: not recursive" allow 'rm -f sub/u.txt'
+rm -rf "$WL/repo/sub"
+g commit -q --allow-empty -m local
+wl "rm -rf a repository with an unpushed commit" deny "rm -rf $WL/repo" "$TMP"
+wl "rm -rf .git, an unpushed commit" deny 'rm -rf .git'
+wl "rm -rf through a variable" deny "S=$WL; rm -rf \"\$S/repo\"" "$TMP"
+wl "rm -rf a folder holding that repository" deny "rm -rf $WL" "$TMP"
+wl "rm -rf outside any repository" allow 'rm -rf plain' "$TMP"
+g push -q origin main
+wl "rm -rf a pushed, clean repository" allow "rm -rf $WL/repo" "$TMP"
+wl "rm -rf .git, pushed and clean" allow 'rm -rf .git'
+has "a refusal goes to guard.jsonl" present '"ev": "guard-refuse"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+has "a pass goes to guard.jsonl" present '"ev": "guard-pass"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+unset CTX_GUARD_SCRATCH GD
+
 # --- live: the worker ---------------------------------------------------------------
 # Not hermetic (needs the worker signed in via ctx-login, and the network), so
 # it is opt-in. The wall checks run commands inside the sandbox directly instead

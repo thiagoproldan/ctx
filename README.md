@@ -32,6 +32,9 @@ plugin, the same way ekko is.
      `offset`/`limit` reads pass.
    - `check-bash-read` — `PreToolUse` on `Bash`: parses the command with `shfmt`
      and denies it if the whole command line would print more than the threshold.
+   - `guard-work-loss` — `PreToolUse` on `Bash`: denies a git or `rm -r` call
+     only when it would destroy work that exists nowhere else, and says what
+     (see _The work-loss guard_).
    - `announce-graph` — `SessionStart`: if the project has a graphify index, say
      so on turn zero.
    - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
@@ -209,6 +212,40 @@ typed are listed in `$CTX_STATE/auto/<session>.typed` and passed over when
 presence is read. The 5-hour trigger never resets: a reset spends the window,
 it does not spare it.
 
+## The work-loss guard
+
+With `bypassPermissions` on, no classifier stands between Claude and a
+`git reset --hard`. A replay of this machine's 30,334 tool calls from
+2026-08-04 to 2026-09-26 found 93 git calls of the kinds that can lose work
+(`reset --hard`, `checkout --`, `branch -D`, `worktree remove --force`,
+`stash drop`) and 247 `rm -r`: most of them routine, on scratch repositories or
+on work already committed. A rule keyed on the command's name would stop all of
+them. `guard-work-loss` is keyed on state instead: it follows `cd`, `pushd`,
+`git -C` and variables through the command, reads each repository, and denies
+a call only when it would destroy something with no other copy, naming it and
+how to keep it.
+
+| Call                                                                | Refused when it would destroy                          |
+| ------------------------------------------------------------------- | ------------------------------------------------------ |
+| `reset --hard`, `checkout -f`, `switch --discard-changes`           | uncommitted changes to tracked files                   |
+| `checkout [<rev>] -- <paths>`, `checkout .`, `restore`, `git rm -f` | changes under those paths (`restore --staged` passes)  |
+| `clean -f`                                                          | what `git clean -n` with the same flags lists          |
+| `stash drop`, `stash clear`                                         | a stash whose changes are not already in the work tree |
+| `branch -D`                                                         | commits no other branch, tag or remote holds           |
+| `worktree remove --force`                                           | that worktree's changes, untracked files included      |
+| a forced push, or a delete, to the remote's default branch          | commits on the remote the push would drop              |
+| `rm -r` inside a repository                                         | untracked or modified files under the path             |
+| `rm -r` of a repository, its `.git`, or a folder holding one        | changes, stashes, and commits no remote has            |
+
+A `git stash` or `git commit` earlier in the same command counts as keeping
+the work, so the fix the reason suggests, run as one command, passes. Not
+guarded: the scratch roots (`CTX_GUARD_SCRATCH`), `rm -r` outside any
+repository, where no state says whether a copy exists, and whatever a script
+the command runs does, which the hook never sees. The threat is an accident,
+not a hijacked agent: a hook sees only the literal call. Any error in the guard
+lets the call through. Every call it examines, refused or not, goes to
+`$CTX_STATE/guard.jsonl`.
+
 ## The worker: Gemini through `agy`, sandboxed
 
 Upstream talks to AiKA Modes via `portal-cli` (Gemini 2.5 Flash), Spotify-internal
@@ -371,6 +408,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_AUTO_RESET_IDLE`   | `10`                      | Stop hook: idle minutes that make the user away (0 off)            |
 | `CTX_AUTO_RESET_PROMPT` | `continuando`             | Auto reset: what it types into the fresh session                   |
 | `CTX_AUTO_RESET_WAIT`   | `300`                     | Auto reset: seconds each wait lasts before it gives up             |
+| `CTX_GUARD_SCRATCH`     | `/tmp:/var/tmp:…`         | Work-loss guard: colon-separated roots it never guards             |
 
 ## Moving from shunt
 

@@ -14,7 +14,8 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "@root@/hooks/check-bash-read" }
+          { "type": "command", "command": "@root@/hooks/check-bash-read" },
+          { "type": "command", "command": "@root@/hooks/guard-work-loss" }
         ]
       }
     ],

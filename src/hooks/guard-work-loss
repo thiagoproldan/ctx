@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# PreToolUse on Bash: refuse a git or rm call that would destroy work with no
+# other copy, and say what (ekko task 803). The decision lives in
+# lib/guard_work_loss.py; this front only keeps Python off the calls that
+# cannot lose work.
+
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
+
+input=$(cat)
+# Only a command naming one of the verbs that can lose work pays for Python.
+verbs='(^|[^[:alnum:]_-])(reset|checkout|switch|restore|clean|stash|branch|worktree|push|rm)([^[:alnum:]_-]|$)'
+[[ $input =~ $verbs ]] || exit 0
+
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+exec python3 "$here/../lib/guard_work_loss.py" <<<"$input"
