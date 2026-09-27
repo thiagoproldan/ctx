@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Tells the model where the account's 5-hour window stands, and holds a
+# scheduled prompt past the cap (ekko task 808, decision 863).
+#
+# Usage, one per event: window start (SessionStart), window prompt
+# (UserPromptSubmit), window tool (PostToolUse on every tool).
+#
+#   start   the reading in one line, as the session begins or comes back from
+#           a /clear or a compaction: "ctx: 5h 62% until 21:40, cap 85% · 7d 48%".
+#   prompt  the same line with every prompt, and past the cap what the cap asks.
+#           A scheduled prompt past the cap -- a /loop wakeup, a cron's fire:
+#           the input's source, loop_wakeup or schedule_wakeup -- is held, and
+#           a recurring one fires again after the window resets. A prompt
+#           without a source counts as the user's (Claude Code says payloads
+#           may omit it while the field rolls out), and so does ctx's own
+#           'continuando', which bin/auto-reset does not type past the cap.
+#   tool    mid-turn, once, when the window crosses 70% or the cap: a turn left
+#           alone can run for hours between two prompts.
+#
+# The reading is the one bin/statusline leaves for the account (lib/window.sh);
+# without one -- no status line yet, or its window ended -- nothing is said.
+# Each session's band last told is kept in $CTX_STATE/window/told/<session>.
+set -u
+
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
+
+event="${1:-}"
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+# shellcheck source=../lib/window.sh
+. "$here/../lib/window.sh"
+STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+
+# The start of the input names the session. A tool's input can be long -- the
+# file a Read returned -- so only its first 4 KiB are read into bash, and the
+# rest is drained for Claude Code, which writes it all.
+if [ "$event" = "tool" ]; then
+  input=$(head -c 4096)
+  cat >/dev/null
+else
+  input=$(cat)
+fi
+sid=""
+[[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] && sid="${BASH_REMATCH[1]}"
+# The session id names a file below: nothing that could leave the directory.
+case "$sid" in '' | */* | .*) exit 0 ;; esac
+
+read -r five resets seven <<<"$(ctx_window)"
+[ -n "${five:-}" ] || exit 0
+band=$(ctx_window_band "$five")
+told="$STATE/window/told/$sid"
+was=""
+[ -r "$told" ] && read -r was <"$told"
+case "$was" in '' | *[!0-9]*) was=0 ;; esac
+tell() { { mkdir -p "${told%/*}" && echo "$band" >"$told"; } 2>/dev/null; }
+
+# Mid-turn, told only of a band crossed upwards; a window that reset re-arms
+# them. Everything below is paid only when there is something to say.
+if [ "$event" = "tool" ] && [ "$band" -le "$was" ]; then
+  [ "$band" -lt "$was" ] && tell
+  exit 0
+fi
+
+say="ctx: $(ctx_window_line "$five" "$resets" "$seven")."
+case "$band" in
+  1) say="$say Past 70%: pace the work, and start nothing long -- a paired run, a sweep of subagents -- that the rest of the window may not hold." ;;
+  2) say="$say $(ctx_window_rule)" ;;
+esac
+
+# shellcheck source=../lib/ledger.sh
+. "$here/../lib/ledger.sh"
+emit() { jq -n --arg e "$1" --arg t "$2" '{hookSpecificOutput: {hookEventName: $e, additionalContext: $t}}'; }
+
+case "$event" in
+  start)
+    tell
+    emit SessionStart "$say"
+    ;;
+  prompt)
+    source=$(printf '%s' "$input" | jq -r '.source // ""' 2>/dev/null)
+    if [ "$band" -eq 2 ] && { [ "$source" = loop_wakeup ] || [ "$source" = schedule_wakeup ]; }; then
+      CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log window-held "$sid" source "$source" five "$five"
+      jq -n --arg r "ctx held this scheduled prompt: the 5-hour window is at ${five}%, past the $(ctx_window_cap)% cap, until $(date -d "@$resets" +%H:%M). The rest of the window is the user's reserve; a recurring schedule fires again after the window resets." \
+        '{decision: "block", reason: $r}'
+      exit 0
+    fi
+    tell
+    emit UserPromptSubmit "$say"
+    ;;
+  tool)
+    tell
+    CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log window-crossed "$sid" band "$band" five "$five"
+    emit PostToolUse "$say"
+    ;;
+esac
+exit 0

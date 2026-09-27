@@ -12,9 +12,11 @@
 # and clear, before a limit stop leaves a huge context to resume cold (a
 # single cold resume measured 332k-1.86M input-equivalent units).
 #
-# It also leaves this session's 5-hour reading where the Stop hook
-# (hooks/handoff) finds it: the hook's input carries no rate limits, and the
-# status line is the only place Claude Code hands them out.
+# It also leaves the account's 5-hour reading where the hooks find it
+# (lib/window.sh): no hook's input carries the rate limits, and the status
+# line is the only place Claude Code hands them out. The Stop hook asks for
+# the handoff past the cap on it, hooks/window tells the model where it
+# stands, and hooks/guard-window refuses new work past the cap (ekko task 808).
 #
 # Once this session has written a handoff (hooks/handoff-written notes the
 # context it was written at), the context segment says how old it is:
@@ -42,7 +44,8 @@ color=1
 [ -n "${NO_COLOR:-}" ] && color=0
 
 state="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
-readings="$state/sessions"
+# shellcheck source=../lib/window.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/window.sh"
 
 # The payload is read once, with builtins. The session id is picked out of it
 # before jq runs, because it names the file holding the context at which this
@@ -59,12 +62,14 @@ fi
 case "$written" in '' | *[!0-9]*) written=null ;; esac
 
 # One jq process: the status line runs after every assistant message and on a
-# timer, so it must stay cheap. Its first two lines are the reading for the
-# Stop hook (session id, 5-hour percentage), the third the status line. A
-# malformed payload prints nothing rather than an error in the footer.
+# timer, so it must stay cheap. Its first three lines are the reading for the
+# hooks (the 5-hour percentage, when that window ends, the 7-day percentage),
+# the fourth the status line. A malformed payload prints nothing rather than
+# an error in the footer.
 {
-  IFS= read -r sid || exit 0
-  IFS= read -r five || five=""
+  IFS= read -r five || exit 0
+  IFS= read -r resets || resets=""
+  IFS= read -r seven || seven=""
   IFS= read -r line || line=""
 } < <(jq -r \
   --argjson ht "$handoff_tokens" --argjson h5 "$handoff_5h" --argjson hw "$written" \
@@ -117,14 +122,11 @@ case "$written" in '' | *[!0-9]*) written=null ;; esac
     ]
     | map(select(. != null and . != ""))
     | join(" · ")) as $line
-  | (.session_id // "" | tostring),
-    (.rate_limits.five_hour.used_percentage | if type == "number" then floor | tostring else "" end),
+  | (.rate_limits.five_hour.used_percentage | if type == "number" then floor | tostring else "" end),
+    (.rate_limits.five_hour.resets_at | if type == "number" then floor | tostring else "" end),
+    (.rate_limits.seven_day.used_percentage | if type == "number" then floor | tostring else "" end),
     $line
 ' <<<"$payload" 2>/dev/null)
 
-# The session id names a file: nothing that could leave the directory.
-case "$sid" in
-  '' | */* | .*) ;;
-  *) [ -n "$five" ] && { mkdir -p "$readings" && printf '%s\n' "$five" >"$readings/$sid"; } 2>/dev/null ;;
-esac
+ctx_window_merge "$five" "$resets" "$seven"
 printf '%s\n' "$line"

@@ -1,7 +1,7 @@
 {
   "name": "ctx",
   "version": "@version@",
-  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends, then shows how old it is; with the user away, types the /clear and 'continuando' into the session's Konsole tab itself; and stops once a prompt that would re-write a big expired cache.",
+  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends, then shows how old it is; with the user away, types the /clear and 'continuando' into the session's Konsole tab itself; stops once a prompt that would re-write a big expired cache; and tells the model where the account's 5-hour window stands, refusing past its cap the new work a session starts on its own.",
   "homepage": "https://github.com/thiagoproldan/ctx",
   "hooks": {
     "PreToolUse": [
@@ -23,7 +23,14 @@
         "hooks": [
           { "type": "command", "command": "@root@/hooks/check-bash-read" },
           { "type": "command", "command": "@root@/hooks/guard-work-loss" },
-          { "type": "command", "command": "@root@/hooks/guard-secrets" }
+          { "type": "command", "command": "@root@/hooks/guard-secrets" },
+          { "type": "command", "command": "@root@/hooks/guard-window" }
+        ]
+      },
+      {
+        "matcher": "Agent|Task|CronCreate|ScheduleWakeup",
+        "hooks": [
+          { "type": "command", "command": "@root@/hooks/guard-window" }
         ]
       }
     ],
@@ -37,19 +44,25 @@
         "hooks": [
           { "type": "command", "command": "@root@/hooks/handoff-written" }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": "@root@/hooks/window tool" }]
       }
     ],
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "@root@/hooks/announce-graph" }
+          { "type": "command", "command": "@root@/hooks/announce-graph" },
+          { "type": "command", "command": "@root@/hooks/window start" }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "@root@/hooks/cold-return" }
+          { "type": "command", "command": "@root@/hooks/cold-return" },
+          { "type": "command", "command": "@root@/hooks/window prompt" }
         ]
       }
     ],

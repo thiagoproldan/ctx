@@ -30,7 +30,9 @@
 # an interactive session (CLAUDE_CODE_ENTRYPOINT cli), and not while anything
 # but a background shell is pending: a scheduled wakeup, a monitor or a
 # subagent was not tested across a /clear. The 5-hour trigger never resets: a
-# reset costs the window, it does not spare it.
+# reset costs the window, it does not spare it. Past the cap on the window
+# (ekko task 808) bin/auto-reset types the /clear and not 'continuando': the
+# fresh session waits for the user, whose reserve the rest of the window is.
 #
 # Nor when a handoff this session wrote is still fresh: less than a tenth of
 # the threshold of context since (hooks/handoff-written notes each one). The
@@ -40,7 +42,8 @@
 #
 # The context is the last main-thread call's input, read from the end of the
 # transcript (input + cache writes + cache reads); the 5-hour reading is the
-# one the status line left for this session, when it is recent.
+# account's, which the status line leaves (lib/window.sh): past the cap it
+# stands until its window ends.
 set -u
 
 [ "${CTX_DISABLE:-0}" = "1" ] && exit 0
@@ -52,6 +55,8 @@ STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/handoff.sh
 . "$ROOT/lib/handoff.sh"
+# shellcheck source=../lib/window.sh
+. "$ROOT/lib/window.sh"
 
 input=$(cat)
 sid="" transcript="" active=false pending=0 unshelled=0
@@ -132,10 +137,8 @@ fi
 [ "$active" = "true" ] && exit 0
 
 five=""
-reading="$STATE/sessions/$sid"
-if [ "$limit_5h" -gt 0 ] && [ -n "$(find "$reading" -mmin -10 2>/dev/null)" ]; then
-  five=$(int_or "$(head -c 8 "$reading" 2>/dev/null | tr -d '\n')" "")
-fi
+[ "$limit_5h" -gt 0 ] && read -r five _ <<<"$(ctx_window)"
+five=$(int_or "${five:-}" "")
 
 band=0
 [ "$threshold" -gt 0 ] && band=$((tokens / threshold))
@@ -149,8 +152,8 @@ was_band=$(int_or "${was_band:-}" 0)
 was_hot=$(int_or "${was_hot:-}" 0)
 last_band=$was_band last_hot=$was_hot
 
-# Re-arm what came back down. Without a fresh 5-hour reading, its state is
-# left as it was.
+# Re-arm what came back down. Without a 5-hour reading -- none yet, or its
+# window ended -- its state is left as it was.
 [ "$band" -lt "$last_band" ] && last_band=$band
 [ -n "$five" ] && [ "$hot" -eq 0 ] && last_hot=0
 
@@ -179,8 +182,9 @@ fi
 [ "$ask_tokens" -eq 1 ] && last_band=$band
 [ "$ask_5h" -eq 1 ] && last_hot=1
 record "$last_band" "$last_hot"
-# Readings and books of sessions long gone.
-find "$STATE/sessions" "$STATE/handoff" -type f -mtime +7 -delete 2>/dev/null
+# Books of sessions long gone, and the readings each session kept before the
+# account's (ctx 0.7.0 and earlier).
+find "$STATE/sessions" "$STATE/handoff" "$STATE/window/told" -type f -mtime +7 -delete 2>/dev/null
 
 # A handoff written moments ago already holds the session: the band counts as
 # asked, and the status line shows how fresh the handoff is.
@@ -204,13 +208,18 @@ CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff "$sid" \
 # Alone, the reset follows the handoff by itself: the /clear above is ctx's to
 # type, and the fresh session is all that will know of a task still running.
 auto=""
-if [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ]; then
+if [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ] && [ "$hot" -eq 1 ]; then
+  auto="
+The user has been away for ${away} minutes: once the handoff is written and this turn ends, ctx types /clear into this session's tab, and not '${CTX_AUTO_RESET_PROMPT:-continuando}': past the cap the fresh session waits for the user."
+elif [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ]; then
   auto="
 The user has been away for ${away} minutes: once the handoff is written and this turn ends, ctx types /clear and '${CTX_AUTO_RESET_PROMPT:-continuando}' into this session's tab, and a fresh session goes on from the handoff."
   [ "$pending" -gt 0 ] && auto="$auto
 Background tasks are still running, and their notifications will reach the fresh session: name each in the handoff, with what it does and the file its output goes to."
 fi
 
+rule="Start no new work in this turn."
+[ "$hot" -eq 1 ] && rule="$rule $(ctx_window_rule)"
 jq -n --arg m "ctx: $why. $(ctx_handoff_text "$ROOT")$auto
-Start no new work in this turn." \
+$rule" \
   '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: $m}}'

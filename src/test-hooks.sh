@@ -20,6 +20,10 @@ REAL_WORKER_HOME="${CTX_WORKER_HOME:-${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local
 export CTX_STATE="$TMP/state"
 export CTX_FUNNEL="$TMP/funnel-suite.jsonl"
 export CTX_LEDGER="$TMP/usage-suite.jsonl"
+# The account whose 5-hour reading the hooks share (lib/window.sh) is the
+# profile's folder: one of the suite's own, and another for each group of cases
+# that leaves a reading, so that no reading reaches cases it was not meant for.
+export CLAUDE_CONFIG_DIR="$TMP/profile"
 
 # Never the real tab. Run from a Claude Code session, the suite inherits the
 # D-Bus address of the Konsole tab the user works in, and bin/auto-reset types
@@ -191,6 +195,19 @@ has() {
   fi
 }
 
+# eq <name> <expected> <got> -- defined before any case uses it: a helper
+# called before its definition is "command not found", which counts as
+# neither a pass nor a failure.
+eq() {
+  if [ "$3" = "$2" ]; then
+    pass=$((pass + 1))
+    printf '  ok    %-50s -> %s\n' "$1" "$3"
+  else
+    fail=$((fail + 1))
+    printf '  FAIL  %-50s -> %s (expected %s)\n' "$1" "$3" "$2"
+  fi
+}
+
 PROJ="$TMP/proj"
 mkdir -p "$PROJ/graphify-out" "$PROJ/src/deep/deeper" "$TMP/no-index/src"
 cp "$TMP/big.ts" "$PROJ/src/deep/deeper/big.ts"
@@ -348,6 +365,7 @@ has "the ignored ones are named" present "1x  /p/c.rs" "$rep"
 # footer empty instead of printing an error into it.
 echo "status line:"
 SL="$ROOT/bin/statusline"
+export CLAUDE_CONFIG_DIR="$TMP/profile-sl"
 now=$(date +%s)
 # sl_json <context tokens> <5h percent> <warm: true|false> <cache expires in s> <misses> <miss cause>
 sl_json() {
@@ -400,6 +418,121 @@ out=$(
 )
 has "malformed input: exit 0" present "rc=0" "$out"
 has "malformed input: nothing printed" absent "error" "$out"
+export CLAUDE_CONFIG_DIR="$TMP/profile"
+
+# --- the account's 5-hour window (lib/window.sh) -------------------------------------
+# Every session of an account leaves its reading in the same file, each with
+# what its own process last heard from the API: the readings of one window keep
+# the highest, a later window replaces them, an earlier one is dropped, and a
+# window that ended reads as none (ekko task 808).
+echo "5-hour window:"
+# shellcheck source=lib/window.sh
+. "$ROOT/lib/window.sh"
+at1=$((now + 3600)) at2=$((now + 3600 + 18000))
+w() { CLAUDE_CONFIG_DIR="$TMP/profile-w" "$@"; }
+w ctx_window_merge 60 "$at1" 40
+w ctx_window_merge 55 "$at1" 38
+eq "an idle session's older number: the highest stays" "60 $at1 40" "$(w ctx_window)"
+w ctx_window_merge 12 "$at2" 41
+eq "a later window replaces it" "12 $at2 41" "$(w ctx_window)"
+w ctx_window_merge 90 "$at1" 45
+eq "an earlier window is dropped" "12 $at2 41" "$(w ctx_window)"
+w ctx_window_merge 20 $((at2 + 120)) -
+eq "the same window, its end rounded: the highest" "20 $((at2 + 120)) 41" "$(w ctx_window)"
+echo "95 $((now - 60)) 50" >"$CTX_STATE/window/profile-w"
+eq "a window that ended reads as none" "" "$(w ctx_window)"
+eq "the account is the profile's folder" "claude-trabalho" "$(CLAUDE_CONFIG_DIR=/home/x/.claude-trabalho/ ctx_account)"
+eq "...~/.claude without the variable" "claude" "$(env -u CLAUDE_CONFIG_DIR HOME=/home/x bash -c '. "$0"; ctx_account' "$ROOT/lib/window.sh")"
+sl_json 45000 62.4 true 1830 0 "" | env NO_COLOR=1 CLAUDE_CONFIG_DIR="$TMP/profile-s" "$SL" >/dev/null
+eq "the status line leaves the account's reading" "62 $at1 41" "$(CLAUDE_CONFIG_DIR="$TMP/profile-s" ctx_window)"
+eq "one line for the model" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 41%" "$(ctx_window_line 62 "$at1" 41)"
+
+# --- window (SessionStart, UserPromptSubmit, PostToolUse) ------------------------------
+# The model is told the reading as a session starts and with every prompt, and
+# mid-turn once the window crosses 70% or the cap; past the cap a scheduled
+# prompt is held, and the user's goes through with what the cap asks.
+echo "window (SessionStart, UserPromptSubmit, PostToolUse):"
+WH="$HOOKS/window"
+PW="$TMP/profile-h"
+# wh <event> [env...] -- the hook's output for the input on stdin
+wh() {
+  local ev="$1"
+  shift
+  env -u CTX_DISABLE -u CTX_HANDOFF_5H CLAUDE_CONFIG_DIR="$PW" "$@" "$WH" "$ev" 2>&1
+}
+told() { printf '%s' "$1" | jq -r '.hookSpecificOutput.additionalContext // .reason // ""' 2>/dev/null; }
+held() { printf '%s' "$1" | jq -r '.decision // ""' 2>/dev/null; }
+tool() { printf '{"session_id":"%s","tool_name":"Read"}' "$1" | wh tool; }
+eq "no reading: nothing said" "" "$(printf '{"session_id":"w1","source":"startup"}' | wh start)"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 62 "$at1" 48
+out=$(printf '{"session_id":"w1","source":"startup"}' | wh start)
+eq "start: the reading in one line" "ctx: 5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 48%." "$(told "$out")"
+eq "...as SessionStart's context" "SessionStart" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.hookEventName')"
+has "prompt: the same line" present "ctx: 5h 62%" "$(told "$(printf '{"session_id":"w1","prompt":"oi","source":"user"}' | wh prompt)")"
+eq "tool, the same band: nothing" "" "$(tool w1)"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 74 "$at1" 48
+has "tool: 70% crossed, told" present "Past 70%: pace the work" "$(told "$(tool w1)")"
+eq "...once" "" "$(tool w1)"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 86 "$at1" 48
+has "tool: the cap crossed, told the rule" present "Past the cap the rest of the window is the user's reserve" "$(told "$(tool w1)")"
+has "...logged" present '"ev":"window-crossed","sid":"w1"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
+for source in loop_wakeup schedule_wakeup; do
+  out=$(jq -nc --arg s "$source" '{session_id: "w1", prompt: "check", source: $s}' | wh prompt)
+  eq "past the cap, source $source: held" "block" "$(held "$out")"
+done
+has "...fires again after the reset" present "fires again after the window resets" "$(told "$out")"
+has "...logged" present '"ev":"window-held","sid":"w1"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
+for source in user system sdk ""; do
+  out=$(jq -nc --arg s "$source" '{session_id: "w1", prompt: "sigo?"} + (if $s == "" then {} else {source: $s} end)' | wh prompt)
+  eq "past the cap, source ${source:-absent}: goes through" "" "$(held "$out")"
+done
+has "...with what the cap asks" present "A prompt the user sends goes through" "$(told "$out")"
+eq "CTX_HANDOFF_5H=0: nothing held" "" \
+  "$(held "$(jq -nc '{session_id: "w1", prompt: "check", source: "loop_wakeup"}' | wh prompt CTX_HANDOFF_5H=0)")"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 10 "$at2" 50
+eq "a new window: nothing" "" "$(tool w1)"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 71 "$at2" 50
+has "...and its 70% told again" present "Past 70%" "$(told "$(tool w1)")"
+# A tool's input can be long: the hook reads its start and drains the rest.
+out=$({
+  printf '{"session_id":"w2","tool_name":"Read","tool_response":"'
+  head -c 2000000 /dev/zero | tr '\0' a
+  printf '"}'
+} | wh tool)
+has "a 2 MB tool input: read, and told" present "Past 70%" "$(told "$out")"
+
+# --- window guard (PreToolUse) ------------------------------------------------------
+# Past the cap, the work a session starts on its own is refused: a subagent, a
+# new schedule, a headless claude. Everything else goes, and nothing is refused
+# under the cap.
+echo "window guard (PreToolUse):"
+PG="$TMP/profile-g"
+gw() { CLAUDE_CONFIG_DIR="$PG" check "$@"; }
+tool_json() { jq -nc --arg t "$1" '{tool_name: $t, tool_input: {description: "x", prompt: "y"}, session_id: "suite", cwd: "/tmp"}'; }
+gw "no reading: a subagent goes" allow guard-window "$(tool_json Agent)"
+CLAUDE_CONFIG_DIR="$PG" ctx_window_merge 84 "$at1" 40
+gw "84%: a subagent goes" allow guard-window "$(tool_json Agent)"
+gw "84%: claude -p goes" allow guard-window "$(bash_json 'claude -p "resume o repo"')"
+CLAUDE_CONFIG_DIR="$PG" ctx_window_merge 85 "$at1" 40
+gw "85%: a subagent is refused" deny guard-window "$(tool_json Agent)"
+gw "...Task, its old name" deny guard-window "$(tool_json Task)"
+gw "...a new cron" deny guard-window "$(tool_json CronCreate)"
+gw "...a wakeup" deny guard-window "$(tool_json ScheduleWakeup)"
+gw "...claude -p" deny guard-window "$(bash_json 'claude -p "resume o repo"')"
+gw "...claude --print, after cd, under timeout" deny guard-window "$(bash_json 'cd /tmp && timeout 600 claude --print x | tee o')"
+gw "...inside bash -c" deny guard-window "$(bash_json 'bash -c "claude -p x"')"
+gw "claude --version goes" allow guard-window "$(bash_json 'claude --version')"
+gw "claude -p in a commit message goes" allow guard-window "$(bash_json 'git commit -m "claude -p is refused past the cap"')"
+gw "another Bash call goes" allow guard-window "$(bash_json 'ls ~/.claude/projects')"
+gw "a Read goes" allow guard-window "$(tool_json Read)"
+CTX_HANDOFF_5H=0 gw "CTX_HANDOFF_5H=0: no cap" allow guard-window "$(tool_json Agent)"
+EKKO_FAKE=through gw "the user let it through in ekko's menu" allow guard-window "$(tool_json Agent)"
+out=$(tool_json Agent | env -u CTX_DISABLE CLAUDE_CONFIG_DIR="$PG" EKKO_FAKE=refused "$HOOKS/guard-window" |
+  jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
+has "the reason names the window and the cap" present "the 5-hour window is at 85%, past the 85% cap, until $(date -d "@$at1" +%H:%M)" "$out"
+has "...and how to ask the user" present 'allow set to "abc123"' "$out"
+has "refusals are logged" present '"ev": "window-refuse"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+has "...and the call let through" present '"ev": "window-excepted"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 
 # --- handoff (Stop) -----------------------------------------------------------------
 # Past the threshold the turn stays open once, with the ask as context for
@@ -493,30 +626,31 @@ has "malformed input: exit 0" present "rc=0" "$out"
 has "malformed input: nothing printed" absent "{" "$out"
 has "each ask is logged" present '"ev":"handoff"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
 
-# The 5-hour trigger reads what the status line left for the session.
-# sl5 <session> <5h percent>
+# The 5-hour trigger reads the account's reading, which the status line leaves
+# (lib/window.sh); these sessions share an account of their own.
+# sl5 <5h percent> [window: 1, or 2 for the next one]
 sl5() {
-  jq -nc --arg s "$1" --argjson p "$2" '
-    {session_id: $s, model: {display_name: "Opus 5"},
+  jq -nc --argjson p "$1" --argjson r "$((now + 3600 + (${2:-1} - 1) * 18000))" '
+    {session_id: "any", model: {display_name: "Opus 5"},
      context_window: {total_input_tokens: 45000},
-     rate_limits: {five_hour: {used_percentage: $p}}}' |
-    env NO_COLOR=1 "$SL" >/dev/null
+     rate_limits: {five_hour: {used_percentage: $p, resets_at: $r}}}' |
+    env NO_COLOR=1 CLAUDE_CONFIG_DIR="$TMP/profile-5h" "$SL" >/dev/null
 }
-sl5 f 90.6
-has "status line leaves the 5h reading" present "90" "$(cat "$CTX_STATE/sessions/f" 2>/dev/null)"
-out=$(stop f 50000)
+stop5() { CLAUDE_CONFIG_DIR="$TMP/profile-5h" stop "$@"; }
+sl5 90.6
+has "status line leaves the account's 5h reading" present "90 " "$(cat "$CTX_STATE/window/profile-5h" 2>/dev/null)"
+out=$(stop5 f 50000)
 is "5h at 90%, small context: asks" ask "$out"
 has "names the 5-hour window" present "5-hour usage window is at 90%" "$out"
-is "5h still at 90%: quiet" quiet "$(stop f 50000)"
-sl5 f 40
-stop f 50000 >/dev/null
-sl5 f 88
-is "window back under 85%, then over: asks" ask "$(stop f 50000)"
-sl5 g 95
-touch -d '20 minutes ago' "$CTX_STATE/sessions/g"
-is "a 20-minute-old 5h reading is ignored" quiet "$(stop g 50000)"
-sl5 h 90
-has "both triggers in one ask" present ", and the 5-hour" "$(stop h 300000)"
+has "...and what the cap asks" present "Past the cap the rest of the window is the user's reserve" "$out"
+is "5h still at 90%: quiet" quiet "$(stop5 f 50000)"
+sl5 40 2
+stop5 f 50000 >/dev/null
+sl5 88 2
+is "a new window under 85%, then over: asks" ask "$(stop5 f 50000)"
+mkdir -p "$CTX_STATE/window" && echo "95 $((now - 60)) -" >"$CTX_STATE/window/profile-ended"
+is "a reading whose window ended is ignored" quiet "$(CLAUDE_CONFIG_DIR="$TMP/profile-ended" stop g 50000)"
+has "both triggers in one ask" present ", and the 5-hour" "$(stop5 h 300000)"
 
 # --- handoff written (PostToolUse) and its age ------------------------------------
 # Each handoff ekko accepts leaves the context it was written at, and nothing
@@ -574,9 +708,9 @@ printf '100000\n' >"$CTX_STATE/handoff/m.written"
 is "handoff at 100k, stop at 260k: asks" ask "$(stop m 260000)"
 printf '400000\n' >"$CTX_STATE/handoff/n.written"
 is "handoff from before a compaction: asks" ask "$(stop n 260000)"
-sl5 q 90
+sl5 90 2
 printf '45000\n' >"$CTX_STATE/handoff/q.written"
-is "5h at 90% with a fresh handoff: quiet" quiet "$(stop q 50000)"
+is "5h at 90% with a fresh handoff: quiet" quiet "$(stop5 q 50000)"
 
 # The status line gives the handoff's age in context: fresh under a tenth of
 # the threshold, stale past it.
@@ -608,15 +742,6 @@ has "session id with a slash: no age" absent "ago" \
 # Enter on anything else appends it as a typed row.
 echo "auto reset (Stop, bin/auto-reset):"
 # eq <name> <expected> <got>
-eq() {
-  if [ "$3" = "$2" ]; then
-    pass=$((pass + 1))
-    printf '  ok    %-50s -> %s\n' "$1" "$3"
-  else
-    fail=$((fail + 1))
-    printf '  FAIL  %-50s -> %s (expected %s)\n' "$1" "$3" "$2"
-  fi
-}
 # shellcheck source=lib/konsole.sh
 . "$ROOT/lib/konsole.sh"
 # shellcheck source=lib/handoff.sh
@@ -820,6 +945,15 @@ WAIT=3 reset_env "$AR" s-a8 "$TMP/ar-a8/s-a8.jsonl" $$
 eq "the box changes at every reading: nothing typed" "'' " "$(sent)"
 has "...logged" present "changed between readings" "$(said s-a8)"
 
+# Past the cap on the 5-hour window, the /clear and not the prompt: the fresh
+# session waits for the user (ekko task 808).
+CLAUDE_CONFIG_DIR="$TMP/profile-c" ctx_window_merge 90 "$at1" 40
+tab a9
+rows "$TMP/ar-a9/s-a9.jsonl" 300000 human:40
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-c" "$AR" s-a9 "$TMP/ar-a9/s-a9.jsonl" $$
+eq "past the cap: /clear, and not the prompt" "'' /clear \$'\\r' " "$(sent)"
+has "...logged as held" present '"held":"cap"' "$(said s-a9)"
+
 tab a5 busy
 rows "$TMP/ar-a5/s-a5.jsonl" 300000 human:40
 WAIT=8 reset_env "$AR" s-a5 "$TMP/ar-a5/s-a5.jsonl" $$ &
@@ -889,6 +1023,9 @@ has "CTX_AUTO_RESET_IDLE=0: the ask without the reset" absent "ctx types" "$out"
 transcript "$TMP/ar-h3/old.jsonl" 262000
 out=$(stop_auto s-h8 "$(stop_json s-h8 "$TMP/ar-h3/old.jsonl")")
 has "no origin in the transcript: never alone" absent "ctx types" "$out"
+out=$(stop_auto s-h9 "$(stop_json s-h9 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-c")
+has "alone past the cap: the /clear, not 'continuando'" present "ctx types /clear into this session's tab, and not 'continuando'" "$out"
+has "...and what the cap asks" present "Past the cap the rest of the window is the user's reserve" "$out"
 
 # --- cold return (UserPromptSubmit) -------------------------------------------------
 # A prompt that comes back to a big session past the cache's hour is stopped

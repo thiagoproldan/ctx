@@ -38,14 +38,20 @@ plugin, the same way ekko is.
    - `guard-secrets` — `PreToolUse` on `Read`, `Grep` and `Bash`: denies a call
      that would bring secret material into the context, and says what (see
      _The secrets guard_).
+   - `guard-window` — `PreToolUse` on `Agent`, `Task`, `CronCreate`,
+     `ScheduleWakeup` and `Bash`: past the cap on the 5-hour window, denies the
+     work a session starts on its own (see _The 5-hour cap_).
+   - `window` — `SessionStart`, `UserPromptSubmit` and `PostToolUse` on every
+     tool: tells the model where the account's 5-hour window stands, and holds
+     a scheduled prompt past the cap (see _The 5-hour cap_).
    - `announce-graph` — `SessionStart`: if the project has a graphify index, say
      so on turn zero.
    - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
      block, for the funnel.
    - `handoff` — `Stop`: past `CTX_HANDOFF_TOKENS` of context (250k), or the
-     5-hour window past `CTX_HANDOFF_5H` (85%), keeps the turn open once and
-     asks for the ekko handoff and a `/clear` — unless a handoff the session
-     wrote moments before already holds it. With the user away, it has
+     5-hour window past its cap, `CTX_HANDOFF_5H` (85%), keeps the turn open
+     once and asks for the ekko handoff and a `/clear` — unless a handoff the
+     session wrote moments before already holds it. With the user away, it has
      `bin/auto-reset` type the `/clear` and `continuando` into the session's
      Konsole tab (see _A session left alone_).
    - `handoff-written` — `PostToolUse` on ekko's `create` and `batch`: notes the
@@ -89,10 +95,10 @@ At the end of each turn, the `handoff` hook:
   without exploring first. Then one line telling the user to `/clear`;
 - asks once per band: at T, again at 2T, 3T…; a compaction re-arms the bands
   it came back under;
-- asks when the 5-hour window passes `CTX_HANDOFF_5H`, once, re-armed when the
-  window comes back under it. A Stop hook's input carries no rate limits, so
-  the status line leaves each session's reading in `$CTX_STATE/sessions/`, and
-  the hook trusts it for 10 minutes;
+- asks when the 5-hour window passes its cap, `CTX_HANDOFF_5H`, once, re-armed
+  when a later window comes in under it. It reads the account's reading (see
+  _The 5-hour cap_), and past the cap the ask adds what the cap asks: start
+  nothing new;
 - stays quiet while a stop hook is already continuing the turn, and, with the
   user there, while background work or a scheduled wakeup would resume the
   session: it asks at the next stop instead. A `/clear` does not drop a
@@ -213,7 +219,52 @@ Enter typed into one would approve the call. What was measured on 2026-09-26
 A prompt typed this way is recorded as the user's own, so the rows ctx
 typed are listed in `$CTX_STATE/auto/<session>.typed` and passed over when
 presence is read. The 5-hour trigger never resets: a reset spends the window,
-it does not spare it.
+it does not spare it. And past the cap on the window, the reset types the
+`/clear` and not `continuando`: the fresh session costs nothing while it
+waits for the user, whose reserve the rest of the window is.
+
+## The 5-hour cap
+
+The user, 2026-09-26: tell the model where the 5-hour limit stands, cap it at
+85%, and keep the last 15% for emergencies or anything else. The cap is
+`CTX_HANDOFF_5H` (85; 0 turns it off), the same number at which the Stop hook
+asks for the handoff: past it, a session writes its handoff and starts nothing
+new, and the rest of the window is the user's.
+
+**The reading.** Only the status line is handed the rate limits; no hook's
+input carries them (Claude Code 2.1.283). So `ctx-statusline` leaves one
+reading per account in `$CTX_STATE/window/<account>`, named after the
+profile's folder (`CLAUDE_CONFIG_DIR`, `~/.claude` by default): the 5-hour
+percentage, when that window ends, and the 7-day percentage. Every session of
+the account writes the same file, each with the numbers its own process last
+heard from the API, and an idle session's status line, refreshed every 30
+seconds, repeats an old one. Usage never falls within a window, so the readings
+of one window keep the highest, a later window replaces them, and one of an
+earlier window is dropped. A reading at the cap stands until its window ends,
+however old it is, and a window that has ended reads as none.
+
+**What the model is told.** One line as a session starts and with every
+prompt — `ctx: 5h 62% until 21:40, cap 85% · 7d 48%.` — and, mid-turn, once,
+when the window crosses 70% (pace the work; start nothing long) or the cap. A
+turn left alone can run for hours between two prompts.
+
+**What the cap holds back.** Past the cap:
+
+- `guard-window` refuses a subagent (`Agent`, or `Task` as it was named
+  before), a new schedule (`CronCreate`, `ScheduleWakeup`) and a Bash call that
+  runs `claude -p` or `--print`, wherever the command runs it. Each refusal can
+  be lifted for one call through ekko (see _An exception, through ekko_). A
+  script that starts `claude` by itself is not seen.
+- `window` holds a scheduled prompt: a `/loop` wakeup or a cron's fire, told
+  apart by the `source` of `UserPromptSubmit`'s input (`loop_wakeup`,
+  `schedule_wakeup`). A recurring schedule fires again after the window
+  resets. A prompt without a `source` counts as the user's, since Claude Code
+  says payloads may omit it while the field rolls out.
+- `bin/auto-reset` types the `/clear` and not `continuando`.
+
+The user's own prompt goes through, with the reading and what the cap asks:
+the reserve is theirs to spend. The week has no cap; its percentage is in the
+line.
 
 ## The work-loss guard
 
@@ -294,14 +345,14 @@ call that named a secret but sent it elsewhere, goes to
 
 ## An exception, through ekko
 
-A refusal stands unless the user lifts it, for one call. Before either guard
-refuses, it runs `ekko --guard --refuse <reason>` with the call's `PreToolUse`
+A refusal stands unless the user lifts it, for one call. Before any of the
+three guards refuses, it runs `ekko --guard --refuse <reason>` with the call's `PreToolUse`
 event on stdin, when [ekko](https://github.com/thiagoproldan/ekko) 0.25 or
 later is on `PATH`:
 
 - ekko exits 0 when the user's answer in ekko's menu let this exact call
   through: from the same folder and session, once, within 24 hours. The call
-  passes, logged as `guard-excepted` or `secret-excepted`.
+  passes, logged as `guard-excepted`, `secret-excepted` or `window-excepted`.
 - ekko exits 1 after recording the refusal under a short code, and prints the
   sentence the reason ends with: how the session asks the user, through ekko's
   `ask` with that code. The menu shows the call as ekko recorded it, not as the
@@ -463,11 +514,11 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_TIMEOUT_SECONDS`   | `300`                     | Cap per call                                                       |
 | `CTX_MAX_PAYLOAD_BYTES` | `2000000`                 | Payload cap                                                        |
 | `CTX_DISABLE`           | —                         | `1` disarms **every** hook                                         |
-| `CTX_STATE`             | `~/.local/state/ctx`      | Where the ledgers, session readings and worker home live           |
+| `CTX_STATE`             | `~/.local/state/ctx`      | Where the ledgers, window readings and worker home live            |
 | `CTX_WORKER_HOME`       | `$CTX_STATE/worker-home`  | The worker's own home, holding its `agy` login                     |
 | `GRAPHIFY_OUT`          | `graphify-out`            | Read, never set here — honours graphify's own                      |
 | `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
-| `CTX_HANDOFF_5H`        | `85`                      | Status line and Stop hook: 5-hour percentage for a handoff         |
+| `CTX_HANDOFF_5H`        | `85`                      | The cap on the 5-hour window: a handoff, then no new work (0 off)  |
 | `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
 | `CTX_COLD_TOKENS`       | `250000`                  | Cold-return hook: context worth stopping a prompt for (0 off)      |
 | `CTX_COLD_MINUTES`      | `60`                      | Cold-return hook: idle minutes that make the cache cold (0 off)    |

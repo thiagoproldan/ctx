@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# PreToolUse on Agent, Task, CronCreate, ScheduleWakeup and Bash: past the cap
+# on the 5-hour window, refuse the work a session starts on its own (ekko task
+# 808). The decision lives in lib/guard_window.py; this front keeps Python off
+# every call while the window is under the cap, which is nearly all of them.
+
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
+
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+# shellcheck source=../lib/window.sh
+. "$here/../lib/window.sh"
+
+cap=$(ctx_window_cap)
+[ "$cap" -gt 0 ] || exit 0
+read -r five resets _ <<<"$(ctx_window)"
+[ -n "${five:-}" ] && [ "$five" -ge "$cap" ] || exit 0
+
+input=$(cat)
+# A Bash call pays for Python only when it names claude.
+if [[ $input =~ \"tool_name\"[[:space:]]*:[[:space:]]*\"Bash\" ]]; then
+  [[ $input =~ (^|[^[:alnum:]_-])claude([^[:alnum:]_-]|$) ]] || exit 0
+fi
+exec python3 "$here/../lib/guard_window.py" "$five" "$resets" "$cap" <<<"$input"

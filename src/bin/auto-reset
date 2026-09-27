@@ -23,6 +23,11 @@
 # back what it typed itself, a backspace a character, when nothing else
 # changed. Each wait -- for the turn to end, for the fresh session, for it to
 # settle -- lasts up to CTX_AUTO_RESET_WAIT seconds (300).
+#
+# Past the cap on the account's 5-hour window (lib/window.sh, ekko task 808),
+# read as the fresh session comes up, it types the /clear and not the prompt:
+# the fresh session costs nothing while it waits, and the rest of the window
+# is the user's. Logged as auto-reset with held "cap".
 set -u
 
 [ "${CTX_DISABLE:-0}" = "1" ] && exit 0
@@ -37,6 +42,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/lib/konsole.sh"
 # shellcheck source=../lib/ledger.sh
 . "$ROOT/lib/ledger.sh"
+# shellcheck source=../lib/window.sh
+. "$ROOT/lib/window.sh"
 
 # The session id names files below: nothing that could leave the directory.
 case "$sid" in '' | */* | .*) exit 0 ;; esac
@@ -157,6 +164,13 @@ while [ -z "$fresh" ] && [ "$(date +%s)" -lt "$deadline" ]; do
 done
 [ -n "$fresh" ] || stop "no fresh session's transcript within ${wait_s}s of /clear"
 fsid=$(basename -- "$fresh" .jsonl)
+
+read -r five _ <<<"$(ctx_window)"
+cap=$(ctx_window_cap)
+if [ -n "${five:-}" ] && [ "$cap" -gt 0 ] && [ "$five" -ge "$cap" ]; then
+  log auto-reset "$sid" to "$fsid" held cap five "$five"
+  exit 0
+fi
 
 step=prompt
 base=$(size "$fresh")
