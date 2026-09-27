@@ -292,6 +292,26 @@ another. Any error in the guard lets the call through. Each refusal, and each
 call that named a secret but sent it elsewhere, goes to
 `$CTX_STATE/guard.jsonl`.
 
+## An exception, through ekko
+
+A refusal stands unless the user lifts it, for one call. Before either guard
+refuses, it runs `ekko --guard --refuse <reason>` with the call's `PreToolUse`
+event on stdin, when [ekko](https://github.com/thiagoproldan/ekko) 0.25 or
+later is on `PATH`:
+
+- ekko exits 0 when the user's answer in ekko's menu let this exact call
+  through: from the same folder and session, once, within 24 hours. The call
+  passes, logged as `guard-excepted` or `secret-excepted`.
+- ekko exits 1 after recording the refusal under a short code, and prints the
+  sentence the reason ends with: how the session asks the user, through ekko's
+  `ask` with that code. The menu shows the call as ekko recorded it, not as the
+  session describes it.
+- Anything else, or no ekko, and the refusal stands as it was.
+
+Only the user's answer in ekko's menu counts; one a session records does not.
+ekko's own guard, a gotcha whose command cue the user turned on, refuses the
+same way, and one answer lets a call through both.
+
 ## The worker: Gemini through `agy`, sandboxed
 
 Upstream talks to AiKA Modes via `portal-cli` (Gemini 2.5 Flash), Spotify-internal

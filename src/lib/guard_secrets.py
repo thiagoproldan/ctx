@@ -22,9 +22,10 @@ file. Metadata passes: ls, stat, test, wc and file are no readers, and grep -c,
 
 Not guarded: what a sourced .env puts in the environment and a later call
 prints, a script the command runs, and a copy made in one call and read in
-another. Any error lets the call through. Each refusal, and each call that
-named a secret and passed because its output went elsewhere, goes to
-$CTX_STATE/guard.jsonl.
+another. Any error lets the call through. Before refusing, it asks ekko whether
+the user's answer let this exact call through (ekko task 805). Each refusal,
+each call let through that way, and each call that named a secret and passed
+because its output went elsewhere, goes to $CTX_STATE/guard.jsonl.
 """
 
 import fnmatch
@@ -427,11 +428,12 @@ def main():
         path = os.path.join(cwd, given.get("file_path") or "")
         what = secret(path)
         if what:
-            log("secret-refuse", sid, "Read", path, cwd, what)
-            deny(
+            refused = deny(
                 f"ctx's secrets guard refused reading {path}: it is {what}, and would land in the "
-                "context. Its metadata passes: ls -l, stat, test -e, wc -l."
+                "context. Its metadata passes: ls -l, stat, test -e, wc -l.",
+                event,
             )
+            log("secret-refuse" if refused else "secret-excepted", sid, "Read", path, cwd, what)
         return
     if tool == "Grep":
         if (given.get("output_mode") or "files_with_matches") != "content":
@@ -440,11 +442,12 @@ def main():
         glob_ = [given["glob"]] if given.get("glob") else []
         what = held_under(path, True, glob_) if os.path.isdir(path) else secret(path)
         if what:
-            log("secret-refuse", sid, "Grep", path, cwd, what)
-            deny(
+            refused = deny(
                 f"ctx's secrets guard refused a Grep of {path} showing content: it would print "
-                f"lines of {what}. files_with_matches or count pass, and so does a narrower path or glob."
+                f"lines of {what}. files_with_matches or count pass, and so does a narrower path or glob.",
+                event,
             )
+            log("secret-refuse" if refused else "secret-excepted", sid, "Grep", path, cwd, what)
         return
     found, passed = bash(given.get("command") or "", cwd)
     for rule, call, where in passed:
@@ -452,11 +455,12 @@ def main():
     if not found:
         return
     rule, call, where, what = found
-    log("secret-refuse", sid, rule, call, where, what)
-    deny(
+    refused = deny(
         f"ctx's secrets guard refused `{call[:200]}` in {where}: it would print {what} into the "
-        f"context. {keep} A file's metadata passes: ls, stat, test -e, wc, grep -c."
+        f"context. {keep} A file's metadata passes: ls, stat, test -e, wc, grep -c.",
+        event,
     )
+    log("secret-refuse" if refused else "secret-excepted", sid, rule, call, where, what)
 
 
 if __name__ == "__main__":

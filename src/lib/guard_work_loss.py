@@ -17,7 +17,9 @@ Not guarded: paths under the scratch roots (CTX_GUARD_SCRATCH, colon-separated;
 repository, where no state says whether a copy exists, and a script the
 command runs, whose calls the hook never sees.
 
-Each call it examines goes to $CTX_STATE/guard.jsonl, refused or not.
+Each call it examines goes to $CTX_STATE/guard.jsonl, refused or not. Before
+refusing, it asks ekko whether the user's answer let this exact call through
+(ekko task 805); it goes through then, logged as guard-excepted.
 """
 
 import json
@@ -426,12 +428,12 @@ def main():
     if not found:
         return
     rule, call, where, loss, keep = found
-    log("guard-refuse", sid, rule, call, where, loss)
     reason = (
         f"ctx's work-loss guard refused `{call[:200]}` in {where}: it would destroy {loss}. "
         f"That work exists nowhere else. {keep}"
     )
-    deny(reason)
+    refused = deny(reason, event)
+    log("guard-refuse" if refused else "guard-excepted", sid, rule, call, where, loss)
 
 
 if __name__ == "__main__":

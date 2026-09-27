@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import shutil
 import subprocess
 
 HOME = os.path.expanduser("~")
@@ -50,7 +51,39 @@ def log(event, sid, rule, call, where, loss=""):
         pass  # a lost measurement, never a stuck session
 
 
-def deny(reason):
+def excepted(reason, event):
+    """What ekko says of a call a guard is about to refuse (ekko task 805):
+    True when the user's answer in ekko's menu let this exact call through,
+    else the sentence the refusal ends with, on how to ask for it; None when
+    ekko is not installed or cannot tell, and the refusal stands as it is."""
+    ekko = shutil.which("ekko")
+    if not ekko or event is None:
+        return None
+    try:
+        done = subprocess.run(
+            [ekko, "--guard", "--refuse", reason],
+            input=json.dumps(event),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return True
+    if done.returncode == 1 and done.stdout.strip():
+        return done.stdout.strip()
+    return None
+
+
+def deny(reason, event=None):
+    """Refuses the call `event` describes, with `reason`, and returns True;
+    returns False, printing nothing, when ekko says the user let it through."""
+    said = excepted(reason, event)
+    if said is True:
+        return False
+    if said:
+        reason = f"{reason}\n\n{said}"
     print(
         json.dumps(
             {
@@ -62,3 +95,4 @@ def deny(reason):
             }
         )
     )
+    return True

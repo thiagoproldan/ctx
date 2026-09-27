@@ -28,6 +28,29 @@ export CTX_LEDGER="$TMP/usage-suite.jsonl"
 export KONSOLE_DBUS_SERVICE=ctx.test.invalid KONSOLE_DBUS_SESSION=/Sessions/0
 unset CLAUDE_CODE_ENTRYPOINT
 
+# Never the real ekko. Before refusing, the guards ask ekko whether the user let
+# the call through (ekko task 805), and the real one records every refusal it is
+# asked about in the user's ~/.ekko. This one, first on PATH, answers what
+# EKKO_FAKE says and appends its arguments and stdin to EKKO_FAKE_LOG; unset, it
+# cannot tell (exit 2), and a refusal stands as it is.
+EKKOBIN="$TMP/ekkobin"
+mkdir -p "$EKKOBIN"
+cat >"$EKKOBIN/ekko" <<EOF
+#!$(command -v bash)
+{ printf '%s\n' "\$*"; cat; echo; } >>"\${EKKO_FAKE_LOG:-/dev/null}"
+case "\${EKKO_FAKE:-}" in
+through) exit 0 ;;
+refused)
+  echo 'If the user wants this exact call made anyway, ask them with allow set to "abc123".'
+  exit 1
+  ;;
+mute) exit 1 ;;
+*) exit 2 ;;
+esac
+EOF
+chmod +x "$EKKOBIN/ekko"
+export PATH="$EKKOBIN:$PATH"
+
 seq 1 900 | sed 's/^/line /' >"$TMP/big.ts"  # 900 lines
 seq 1 40 | sed 's/^/line /' >"$TMP/small.ts" # 40 lines
 cp "$TMP/big.ts" "$TMP/big.png"
@@ -1194,6 +1217,58 @@ sb "git credential fill" deny "printf 'host=github.com\\n' | git credential fill
 sb "a commit message names gh auth token" allow 'git commit -q --allow-empty -m "gh auth token"'
 has "a refusal goes to guard.jsonl" present '"ev": "secret-refuse"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 has "a secret sent to a file goes to guard.jsonl" present '"ev": "secret-pass"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+
+# --- ekko's answer, before a guard refuses (ekko task 805) ---------------------------
+# A call either guard would refuse, asked of the fake ekko: it goes through only
+# when ekko says the user let it, the refusal gains the sentence ekko gives, and
+# without ekko, or when it cannot tell, the refusal stands as it was.
+echo "ekko's answer, before a guard refuses:"
+# ek <EKKO_FAKE> <hook> <input json>: the hook's output under that answer
+ek() {
+  printf '%s' "$3" | env -u CTX_DISABLE EKKO_FAKE="$1" EKKO_FAKE_LOG="$TMP/ekko.log" \
+    CTX_GUARD_SCRATCH="$TMP/scratch" HOME="$SH" CTX_SECRET_ROOTS="$SEC/persist" "$HOOKS/$2" 2>&1
+}
+why() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""'; }
+NOEKKO="$TMP/noekko"
+mkdir -p "$NOEKKO"
+for c in bash env cat dirname readlink python3 git; do
+  p=$(command -v "$c" 2>/dev/null) && ln -sf "$p" "$NOEKKO/$c"
+done
+printf 'changed\n' >"$WL/repo/a.txt"
+reset=$(wl_json 'git reset --hard')
+: >"$TMP/ekko.log"
+out=$(ek "" guard-work-loss "$reset")
+eq "ekko cannot tell: refused as before" deny "$(verdict "$out")"
+has "  and the reason gains nothing" absent "allow set to" "$(why "$out")"
+has "ekko is asked with the guard's reason" present "--guard --refuse ctx's work-loss guard refused \`git reset --hard\`" "$(cat "$TMP/ekko.log")"
+has "  and the call's event on stdin" present '"command": "git reset --hard"' "$(cat "$TMP/ekko.log")"
+out=$(ek refused guard-work-loss "$reset")
+eq "ekko keeps it refused: refused" deny "$(verdict "$out")"
+has "  the reason still says what would be lost" present "it would destroy" "$(why "$out")"
+eq "  and ends with ekko's sentence" 'If the user wants this exact call made anyway, ask them with allow set to "abc123".' \
+  "$(why "$out" | tail -1)"
+out=$(ek through guard-work-loss "$reset")
+eq "ekko says the user let it through: passes" allow "$(verdict "$out")"
+has "  logged as guard-excepted" present '"ev": "guard-excepted"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+out=$(ek mute guard-work-loss "$reset")
+eq "ekko fails without a word: refused as before" deny "$(verdict "$out")"
+out=$(printf '%s' "$reset" | env -u CTX_DISABLE PATH="$NOEKKO" CTX_GUARD_SCRATCH="$TMP/scratch" "$HOOKS/guard-work-loss" 2>&1)
+eq "no ekko on PATH: refused as before" deny "$(verdict "$out")"
+has "  and the reason gains nothing" absent "allow set to" "$(why "$out")"
+g checkout -q -- a.txt
+
+: >"$TMP/ekko.log"
+out=$(ek through guard-secrets "$(sec_read "$SH/.ssh/id_ed25519")")
+eq "a secret's Read the user let through: passes" allow "$(verdict "$out")"
+has "  logged as secret-excepted" present '"ev": "secret-excepted"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+has "  ekko is asked about the Read itself" present '"file_path": "'"$SH/.ssh/id_ed25519"'"' "$(cat "$TMP/ekko.log")"
+out=$(ek through guard-secrets "$(sec_grep "$SEC/repo" content)")
+eq "a secret's Grep the user let through: passes" allow "$(verdict "$out")"
+out=$(ek refused guard-secrets "$(sec_bash 'cat .env')")
+eq "cat .env, kept refused: refused" deny "$(verdict "$out")"
+has "  the reason ends with ekko's sentence" present 'allow set to "abc123"' "$(why "$out")"
+out=$(ek "" guard-secrets "$(sec_bash 'cat .env')")
+has "cat .env, ekko cannot tell: no sentence" absent "allow set to" "$(why "$out")"
 
 # --- live: the worker ---------------------------------------------------------------
 # Not hermetic (needs the worker signed in via ctx-login, and the network), so
