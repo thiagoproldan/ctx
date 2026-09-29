@@ -56,10 +56,11 @@ plugin, the same way ekko is.
      Konsole tab (see _A session left alone_).
    - `handoff-written` — `PostToolUse` on ekko's `create` and `batch`: notes the
      context at which the session wrote a handoff, so its age can be shown.
-   - `cold-return` — `UserPromptSubmit`: a prompt that comes back to a context
-     of `CTX_COLD_TOKENS` (250k) after `CTX_COLD_MINUTES` (60) idle, when the
-     prompt cache has expired, is stopped once with what going on and starting
-     over would cost and how old the handoff is; sent again, it goes through.
+   - `cold-return` — `UserPromptSubmit`, off by default: with `CTX_COLD_TOKENS`
+     set (250000, the Stop hook's threshold), a prompt that comes back to a
+     context that big after `CTX_COLD_MINUTES` (60) idle, when the prompt cache
+     has expired, is stopped once with what going on and starting over would
+     cost and how old the handoff is; sent again, it goes through.
 2. **Scripts** — `ctx-bulk-read` and `ctx-code-write` do the delegation;
    `ctx-report` and `ctx-test` measure and verify; `ctx-statusline` draws the
    status line.
@@ -139,9 +140,10 @@ over, not in points.
 So the `cold-return` hook reads when the last main-thread call was made (the
 transcript's timestamp; a message Claude Code wrote itself, such as an API
 error, made no call) and stops, once, a prompt that arrives `CTX_COLD_MINUTES`
-(60) or more after it on a context of `CTX_COLD_TOKENS` (250k, the Stop hook's
-threshold) or more. No call is made; Claude Code shows the reason, with what
-going on costs against starting over, and the prompt under it:
+(60) or more after it on a context of `CTX_COLD_TOKENS` or more (250000, the
+Stop hook's threshold, is the value to turn it on with). No call is made;
+Claude Code shows the reason, with what going on costs against starting over,
+and the prompt under it:
 
 ```text
 ctx: idle 1h12m, and the prompt cache has expired: this prompt would first write all 344k tokens of context back to the cache, at twice the input price.
@@ -165,6 +167,15 @@ whether the hook pays. The log alone does not give it: a `/handoff` after the
 stop pays the rewrite, and the prompt sent after that passes as any other,
 with no `cold-pass`. Both stops of the first four days ended that way, which
 only the transcripts showed (ekko task 540).
+
+It is off by default since 0.9.0 (`CTX_COLD_TOKENS` 0, ekko task 929). The
+Stop hook and auto-reset (_A session left alone_) now take the same gain
+before the cache goes cold: in the 1.5 days after 0.8.0 there were 0 rewrites
+of 100k or more after an hour idle, against 7 in the 3.1 days before, while
+the returns after an hour kept coming, to sessions of 34-81k. Where the guard
+did stop a prompt, it saved nothing. What would bring it back is those
+rewrites coming back, from a session auto-reset cannot reach, such as one in
+the background: `CTX_COLD_TOKENS=250000` turns it on.
 
 In a folder without an ekko board, the ask only tells the user. ekko needs
 nothing new for this: the handoff is an ekko note of kind `handoff`, which the
@@ -532,7 +543,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
 | `CTX_HANDOFF_5H`        | `85`                      | The cap on the 5-hour window: a handoff, then no new work (0 off)  |
 | `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
-| `CTX_COLD_TOKENS`       | `250000`                  | Cold-return hook: context worth stopping a prompt for (0 off)      |
+| `CTX_COLD_TOKENS`       | `0`                       | Cold-return hook: context worth stopping a prompt for (0 off)      |
 | `CTX_COLD_MINUTES`      | `60`                      | Cold-return hook: idle minutes that make the cache cold (0 off)    |
 | `CTX_AUTO_RESET_IDLE`   | `10`                      | Stop hook: idle minutes that make the user away (0 off)            |
 | `CTX_AUTO_RESET_PROMPT` | `continuando`             | Auto reset: what it types into the fresh session                   |

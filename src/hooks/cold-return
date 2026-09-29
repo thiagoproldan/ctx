@@ -13,12 +13,19 @@
 # in units where input is 1 and a cache write 2. A point of the window is no
 # fixed number of units -- 175k that day, 63-77k since (ekko task 809) -- so
 # the reason gives going on as a multiple of starting over. Under ~210k of
-# context going on is the cheaper, hence the default of 250k, the Stop hook's
-# threshold. The handoff is mostly there by then: the Stop hook asks for one at
-# each band, and /handoff at the user's moment. /handoff pays the same rewrite,
-# so the reason says it, even when the handoff is fresh: both stops of the
-# first four days ended in /handoff and then the prompt sent again (ekko task
-# 540).
+# context going on is the cheaper, so 250k, the Stop hook's threshold, is the
+# value to turn it on with. The handoff is mostly there by then: the Stop hook
+# asks for one at each band, and /handoff at the user's moment. /handoff pays
+# the same rewrite, so the reason says it, even when the handoff is fresh: both
+# stops of the first four days ended in /handoff and then the prompt sent again
+# (ekko task 540).
+#
+# Off by default since 0.9.0 (ekko task 929): the Stop hook and auto-reset now
+# take this gain before the cache goes cold. In the 1.5 days after 0.8.0 came
+# 0 rewrites of 100k or more after an hour idle, against 7 in the 3.1 days
+# before, while the returns after an hour kept coming, to sessions of 34-81k.
+# Where the guard did stop a prompt, it saved nothing. CTX_COLD_TOKENS=250000
+# turns it back on.
 #
 # The stop costs nothing: no call is made, and Claude Code shows the reason
 # with the prompt under it. Sent again, the prompt goes through; each stop is
@@ -34,7 +41,7 @@ set -u
 [ "${CTX_DISABLE:-0}" = "1" ] && exit 0
 
 int_or() { case "${1:-}" in '' | *[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
-min_tokens=$(int_or "${CTX_COLD_TOKENS:-}" 250000)
+min_tokens=$(int_or "${CTX_COLD_TOKENS:-}" 0)
 minutes=$(int_or "${CTX_COLD_MINUTES:-}" 60)
 threshold=$(int_or "${CTX_HANDOFF_TOKENS:-}" 250000)
 { [ "$min_tokens" -gt 0 ] && [ "$minutes" -gt 0 ]; } || exit 0
