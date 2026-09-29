@@ -1192,6 +1192,23 @@ wl "branch -D, a commit only it has" deny 'git branch -D feat'
 wl "branch -d, git refuses itself" allow 'git branch -d feat'
 g push -q origin feat
 wl "branch -D, pushed" allow 'git branch -D feat'
+# wlwhy <command> -- the reason the guard gives, for a refusal.
+wlwhy() { printf '%s' "$(wl_json "$1")" | env -u CTX_DISABLE "$HOOKS/guard-work-loss" 2>&1; }
+# A commit whose patch another branch holds, rebased or cherry-picked there, is
+# not lost with its branch (ekko task 891); one changed after the copy is, and
+# so is a merge, which has no patch of its own to match. main moves first: a
+# pick onto the commit's own parent within the same second is that very commit.
+g checkout -q -b copied && echo c >"$WL/repo/c.txt" && g add c.txt && g commit -q -m copied &&
+  g checkout -q main && echo m >"$WL/repo/m.txt" && g add m.txt && g commit -q -m "main moves" &&
+  g cherry-pick copied && g push -q origin main
+wl "branch -D, its commit copied to main" allow 'git branch -D copied'
+g checkout -q copied && echo more >>"$WL/repo/c.txt" && g commit -q -am "changed after the copy" && g checkout -q main
+wl "branch -D, a commit changed after the copy" deny 'git branch -D copied'
+has "...counts only that one, the newest" present "copied (1 commit(s), newest: changed after the copy)" \
+  "$(wlwhy 'git branch -D copied')"
+g checkout -q -b merged copied~1 && g merge -q --no-ff -m "merge main" main && g checkout -q main
+wl "branch -D, a merge only it has" deny 'git branch -D merged'
+g branch -D copied merged
 
 g worktree add -q "$WL/wt" -b wtb && echo w >"$WL/wt/w.txt"
 wl "worktree remove --force, an untracked file" deny "git worktree remove --force $WL/wt"
@@ -1222,6 +1239,17 @@ wl "rm -rf outside any repository" allow 'rm -rf plain' "$TMP"
 g push -q origin main
 wl "rm -rf a pushed, clean repository" allow "rm -rf $WL/repo" "$TMP"
 wl "rm -rf .git, pushed and clean" allow 'rm -rf .git'
+# The same rule for a whole repository: a local commit whose patch a remote
+# holds is kept there; one changed after the copy is not.
+g checkout -q -b local-copy && echo l >"$WL/repo/l.txt" && g add l.txt && g commit -q -m "local copy" &&
+  g checkout -q main && echo n >"$WL/repo/n.txt" && g add n.txt && g commit -q -m "main moves again" &&
+  g cherry-pick local-copy && g push -q origin main
+wl "rm -rf a repository, its local commit pushed as a copy" allow "rm -rf $WL/repo" "$TMP"
+wl "rm -rf .git, the same" allow 'rm -rf .git'
+g checkout -q local-copy && echo more >>"$WL/repo/l.txt" && g commit -q -am "changed after the copy" && g checkout -q main
+wl "rm -rf a repository, a commit changed after the copy" deny "rm -rf $WL/repo" "$TMP"
+has "...counts only that one" present "1 commit(s) on local branches" "$(wlwhy 'rm -rf .git')"
+g branch -D local-copy
 has "a refusal goes to guard.jsonl" present '"ev": "guard-refuse"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 has "a pass goes to guard.jsonl" present '"ev": "guard-pass"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 unset CTX_GUARD_SCRATCH GD

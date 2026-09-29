@@ -10,7 +10,11 @@ error: a broken guard must not break the shell.
 Keyed on state, not on the command's name: git reset --hard in a clean tree
 loses nothing its reflog cannot give back, and passes. A git stash or git
 commit earlier in the same command counts as keeping the work, so the fix the
-reason suggests, run as one command, is not refused again.
+reason suggests, run as one command, is not refused again. A commit counts as
+kept when another ref that stays holds its patch, a rebased or cherry-picked
+copy (ekko task 891): git branch -D and rm -r of a repository both ask. A
+forced push to the remote's default branch does not: it rewrites the history
+others fetch, copies or not.
 
 Not guarded: paths under the scratch roots (CTX_GUARD_SCRATCH, colon-separated;
 /tmp, /var/tmp, $XDG_RUNTIME_DIR and ~/.cache by default), rm -r outside any
@@ -32,6 +36,7 @@ from shell_calls import expand, letters, located, operands  # noqa: E402
 
 SAVING_STASH = {None, "push", "save"}
 SHOWN = 5  # paths named in a reason; the rest are counted
+CHERRY_RUNS = 32  # git cherry calls one check may make; past it, no commit counts as copied
 # What a rule returns for a call whose form cannot lose work: not examined.
 SKIP = object()
 
@@ -66,6 +71,35 @@ def porcelain(where, *args):
 
 def after_dashes(args):
     return args[args.index("--") + 1 :] if "--" in args else None
+
+
+def tips(where, refs):
+    """The commits the rev-list arguments `refs` name that none of the others
+    reaches, or None."""
+    named = (git(where, "rev-list", "--no-walk", *refs) or "").split()
+    out = git(where, "merge-base", "--independent", *named) if named else None
+    return out.split() if out else None
+
+
+def uncopied(where, commits, heads, others):
+    """Those of `commits`, reachable from the refs `heads` names, whose patch
+    no commit on the refs `others` names has. git cherry, run from each head
+    against each of the others' tips, marks a commit it finds a copy of with
+    '-'. It lists no merge, so a merge always stays, and so does every commit
+    when git fails or the check would take too many runs."""
+    if not commits:
+        return commits
+    ours, theirs = tips(where, heads), tips(where, others)
+    if not ours or not theirs or len(ours) * len(theirs) > CHERRY_RUNS:
+        return commits
+    copied = set()
+    for tip in theirs:
+        for head in ours:
+            out = git(where, "cherry", tip, head)
+            if out is None:
+                return commits
+            copied.update(line[2:] for line in out.splitlines() if line.startswith("- "))
+    return [commit for commit in commits if commit not in copied]
 
 
 # --- what each call would lose -------------------------------------------------
@@ -194,17 +228,16 @@ def branch(where, args):
     for name in operands(args):
         if git(where, "rev-parse", "-q", "--verify", "refs/heads/" + name) is None:
             continue
-        only = git(
-            where, "rev-list", "--count", "refs/heads/" + name,
-            "--not", "--exclude=" + name, "--branches", "--remotes", "--tags", "HEAD",
-        )
-        if only and int(only) > 0:
-            tip = (git(where, "log", "-1", "--format=%s", "refs/heads/" + name) or "").strip()
-            lost.append(f"{name} ({only.strip()} commit(s), newest: {tip})")
+        others = ["--exclude=" + name, "--branches", "--remotes", "--tags", "HEAD"]
+        only = (git(where, "rev-list", "refs/heads/" + name, "--not", *others) or "").split()
+        only = uncopied(where, only, ["refs/heads/" + name], others)
+        if only:
+            newest = (git(where, "log", "-1", "--format=%s", only[0]) or "").strip()
+            lost.append(f"{name} ({len(only)} commit(s), newest: {newest})")
     if not lost:
         return None
     return (
-        f"branch(es) holding commits no other branch, tag or remote has: {listed(lost)}",
+        f"branch(es) holding commits whose changes no other branch, tag or remote has: {listed(lost)}",
         "Push it or tag it first (git tag keep/<name> <name>), then delete it.",
     )
 
@@ -286,9 +319,10 @@ def repo_loss(root):
         if not remotes:
             parts.append(f"{commits.strip()} commit(s) and no remote to hold them")
         else:
-            local = git(root, "rev-list", "--count", "--branches", "--not", "--remotes")
-            if local and int(local) > 0:
-                parts.append(f"{local.strip()} commit(s) on local branches that no remote has")
+            local = (git(root, "rev-list", "--branches", "--not", "--remotes") or "").split()
+            local = uncopied(root, local, ["--branches"], ["--remotes"])
+            if local:
+                parts.append(f"{len(local)} commit(s) on local branches whose changes no remote has")
     return "; ".join(parts) or None
 
 

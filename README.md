@@ -290,11 +290,18 @@ how to keep it.
 | `checkout [<rev>] -- <paths>`, `checkout .`, `restore`, `git rm -f` | changes under those paths (`restore --staged` passes)  |
 | `clean -f`                                                          | what `git clean -n` with the same flags lists          |
 | `stash drop`, `stash clear`                                         | a stash whose changes are not already in the work tree |
-| `branch -D`                                                         | commits no other branch, tag or remote holds           |
+| `branch -D`                                                         | commits with no copy on another branch, tag or remote  |
 | `worktree remove --force`                                           | that worktree's changes, untracked files included      |
 | a forced push, or a delete, to the remote's default branch          | commits on the remote the push would drop              |
 | `rm -r` inside a repository                                         | untracked or modified files under the path             |
-| `rm -r` of a repository, its `.git`, or a folder holding one        | changes, stashes, and commits no remote has            |
+| `rm -r` of a repository, its `.git`, or a folder holding one        | changes, stashes, and commits with no copy on a remote |
+
+A copy counts: a commit rebased or cherry-picked onto another branch has a new
+id but the same patch, and `git cherry` finds it (ekko task 891). So `branch -D`
+and `rm -r` of a repository pass when every commit they would take has its
+patch on a ref that stays; a merge, which has no patch of its own, never does.
+A forced push to the default branch is refused all the same: it rewrites the
+history others fetch.
 
 A `git stash` or `git commit` earlier in the same command counts as keeping
 the work, so the fix the reason suggests, run as one command, passes. Not
