@@ -128,27 +128,29 @@ Claude Code keeps the context cached for an hour. After a longer pause, the
 next call writes all of it back to the cache, at twice the input price, before
 any work: in the 30 days to 2026-09-24 that happened 65 times, 7.5% of the
 bill, at a median context of 525k, and 58 of them came with the user's next
-prompt. One of 530k cost 7 points of the 5-hour window on 2026-09-23 (about
-175k units a point, input being 1). Starting over costs too: the new session
-writes its ~45k prefix and spends ~331k units finding its way (the mean over
-those 30 days), ~2 points in all. Under ~210k of context, going on is the
-cheaper of the two.
+prompt. One of 530k cost 7 points of the 5-hour window on 2026-09-23.
+Starting over costs too: the new session writes its ~45k prefix and spends
+~331k units finding its way (the mean over those 30 days), ~421k units in all,
+input being 1 and a cache write 2. Under ~210k of context, going on is the
+cheaper of the two. A point of the window is no fixed number of units — 175k
+that day, 63-77k since — so the hook gives going on as a multiple of starting
+over, not in points.
 
 So the `cold-return` hook reads when the last main-thread call was made (the
 transcript's timestamp; a message Claude Code wrote itself, such as an API
 error, made no call) and stops, once, a prompt that arrives `CTX_COLD_MINUTES`
 (60) or more after it on a context of `CTX_COLD_TOKENS` (250k, the Stop hook's
-threshold) or more. No call is made; Claude Code shows the reason, with both
-prices, and the prompt under it:
+threshold) or more. No call is made; Claude Code shows the reason, with what
+going on costs against starting over, and the prompt under it:
 
 ```text
 ctx: idle 1h12m, and the prompt cache has expired: this prompt would first write all 344k tokens of context back to the cache, at twice the input price.
-Going on here costs ~4 points of the 5-hour window before any work; starting over, ~2 points (the new session's prime and first reads).
-The handoff written 4k tokens ago holds this session: /clear starts the next one from it.
+Before any work, going on here costs ~1.6 times what starting over does (the new session's prime and first reads).
+The handoff written 4k tokens ago holds this session: /clear starts the next one from it, no /handoff needed (it costs this same rewrite).
 Sent again, the prompt goes through.
 ```
 
-With a stale handoff, or none, the second line says so, and that `/handoff`
+With a stale handoff, or none, the third line says so, and that `/handoff`
 first costs this same rewrite. Each stop is keyed to the last call it followed
 (`$CTX_STATE/cold/<session>`), so the prompt sent again goes through and the
 next pause after more work can stop again. A slash command always goes
@@ -159,7 +161,10 @@ whose input lists them, keeps the mark (`$CTX_STATE/cold/<session>.scheduled`).
 Each stop, each prompt sent again after one, and each let through for a
 schedule is logged to `$CTX_STATE/handoff.jsonl` (`cold-stop`, `cold-pass`,
 `cold-scheduled`): how often a stop ends in a `/clear` is the count that says
-whether the hook pays.
+whether the hook pays. The log alone does not give it: a `/handoff` after the
+stop pays the rewrite, and the prompt sent after that passes as any other,
+with no `cold-pass`. Both stops of the first four days ended that way, which
+only the transcripts showed (ekko task 540).
 
 In a folder without an ekko board, the ask only tells the user. ekko needs
 nothing new for this: the handoff is an ekko note of kind `handoff`, which the

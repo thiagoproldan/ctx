@@ -8,13 +8,17 @@
 # work: in the 30 days to 2026-09-24, 65 such rewrites after an hour or more
 # idle made 7.5% of the bill, at a median context of 525k, and 58 of them came
 # with the user's next prompt. One of 530k cost 7 points of the 5-hour window
-# on 2026-09-23 -- about 175k units a point, in units where input is 1 and a
-# cache write 2. Starting over costs too: the new session writes its ~45k
+# on 2026-09-23. Starting over costs too: the new session writes its ~45k
 # prefix and spends ~331k units finding its way (the mean over those 30 days),
-# ~2 points in all. The reason gives both prices; under ~210k of context going
-# on is the cheaper, hence the default of 250k, the Stop hook's threshold. The
-# handoff is mostly there by then: the Stop hook asks for one at each band, and
-# /handoff at the user's moment.
+# in units where input is 1 and a cache write 2. A point of the window is no
+# fixed number of units -- 175k that day, 63-77k since (ekko task 809) -- so
+# the reason gives going on as a multiple of starting over. Under ~210k of
+# context going on is the cheaper, hence the default of 250k, the Stop hook's
+# threshold. The handoff is mostly there by then: the Stop hook asks for one at
+# each band, and /handoff at the user's moment. /handoff pays the same rewrite,
+# so the reason says it, even when the handoff is fresh: both stops of the
+# first four days ended in /handoff and then the prompt sent again (ekko task
+# 540).
 #
 # The stop costs nothing: no call is made, and Claude Code shows the reason
 # with the prompt under it. Sent again, the prompt goes through; each stop is
@@ -85,17 +89,12 @@ elif [ "$hours" -ge 1 ]; then
 else
   away="$((idle / 60))m"
 fi
-# points <units> -- in points of the 5-hour window, rounded.
-points() {
-  local n=$((($1 + 87500) / 175000))
-  case "$n" in
-    0) echo "under a point" ;;
-    1) echo "~1 point" ;;
-    *) echo "~$n points" ;;
-  esac
-}
-going=$(points $((2 * tokens)))
-fresh=$(points $((2 * 45000 + 331000)))
+# Going on writes the whole context at twice the input price; starting over
+# writes a ~45k prefix and spends ~331k units finding its way. Their ratio, to
+# a tenth.
+fresh=$((2 * 45000 + 331000))
+tenths=$(((20 * tokens + fresh / 2) / fresh))
+times="$((tenths / 10)).$((tenths % 10))"
 
 written=$(ctx_handoff_written "$STATE" "$sid")
 again="/handoff first costs this same rewrite."
@@ -104,7 +103,7 @@ if [ -z "$written" ]; then
 elif [ "$written" -gt "$tokens" ]; then
   handoff="The last handoff is from before a compaction: /clear starts from it, without the work since; $again"
 elif [ $((tokens - written)) -lt $((threshold / 10)) ]; then
-  handoff="The handoff written $(k $((tokens - written))) tokens ago holds this session: /clear starts the next one from it."
+  handoff="The handoff written $(k $((tokens - written))) tokens ago holds this session: /clear starts the next one from it, no /handoff needed (it costs this same rewrite)."
 else
   handoff="The last handoff is $(k $((tokens - written))) tokens old: /clear starts from it, without the work since; $again"
 fi
@@ -112,6 +111,6 @@ fi
 CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log cold-stop "$sid" tokens "$tokens" idle "$((idle / 60))" written "$written"
 
 jq -n --arg r "ctx: idle $away, and the prompt cache has expired: this prompt would first write all $(k "$tokens") tokens of context back to the cache, at twice the input price.
-Going on here costs $going of the 5-hour window before any work; starting over, $fresh (the new session's prime and first reads).
+Before any work, going on here costs ~$times times what starting over does (the new session's prime and first reads).
 $handoff
 Sent again, the prompt goes through." '{decision: "block", reason: $r}'

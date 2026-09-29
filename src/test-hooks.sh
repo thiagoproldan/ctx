@@ -1085,8 +1085,8 @@ out=$(back c3 344000 72)
 guarded "344k, idle 72m: stops" stop "$out"
 has "says how long it sat idle" present "idle 1h12m" "$(crwhy "$out")"
 has "names the context to re-write" present "all 344k tokens" "$(crwhy "$out")"
-has "prices going on in the 5-hour window" present "Going on here costs ~4 points of the 5-hour window" "$(crwhy "$out")"
-has "...and starting over" present "starting over, ~2 points" "$(crwhy "$out")"
+has "prices going on as a multiple of starting over" present "going on here costs ~1.6 times what starting over does" "$(crwhy "$out")"
+has "...in no points: their price in units moves" absent "point" "$(crwhy "$out")"
 has "no handoff: the board as it is" present "No handoff from this session" "$(crwhy "$out")"
 has "offers /clear" present "/clear" "$(crwhy "$out")"
 has "a subagent's 900k is not the context" absent "900k" "$(crwhy "$out")"
@@ -1100,15 +1100,18 @@ mkdir -p "$CTX_STATE/cold" && : >"$CTX_STATE/cold/c10.scheduled"
 guarded "a wakeup or background work pending: passes" pass "$(back c10 344000 90)"
 has "...and is logged" present '"ev":"cold-scheduled"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
 printf '340000\n' >"$CTX_STATE/handoff/c5.written"
-has "fresh handoff: holds the session" present "handoff written 4k tokens ago holds this session" \
-  "$(crwhy "$(back c5 344000 90)")"
+out=$(crwhy "$(back c5 344000 90)")
+has "fresh handoff: holds the session" present "handoff written 4k tokens ago holds this session" "$out"
+has "...and says /handoff is not needed: it pays the rewrite" present "no /handoff needed (it costs this same rewrite)" "$out"
 printf '264000\n' >"$CTX_STATE/handoff/c6.written"
 has "stale handoff: its age" present "last handoff is 80k tokens old" "$(crwhy "$(back c6 344000 90)")"
 printf '400000\n' >"$CTX_STATE/handoff/c7.written"
 has "handoff from before a compaction: says so" present "from before a compaction" \
   "$(crwhy "$(back c7 344000 90)")"
 has "three days away: in days" present "idle 3 days" "$(crwhy "$(back c8 344000 4320)")"
-has "530k: ~6 points" present "~6 points" "$(crwhy "$(back c9 530000 90)")"
+has "530k: ~2.5 times" present "costs ~2.5 times what" "$(crwhy "$(back c9 530000 90)")"
+has "under 1, with a lower threshold: ~0.7 times" present "costs ~0.7 times what" \
+  "$(crwhy "$(ctr "$TMP/cr-c11.jsonl" 150000 90 && prompt_json c11 "$TMP/cr-c11.jsonl" | env -u CTX_DISABLE -u CTX_COLD_MINUTES -u CTX_HANDOFF_TOKENS CTX_COLD_TOKENS=100000 "$CR" 2>&1)")"
 guarded "missing transcript: passes" pass "$(prompt_json d1 "$TMP/none.jsonl" | cr)"
 ctr "$TMP/cr-x.jsonl" 344000 90
 guarded "session id with a slash: passes" pass "$(prompt_json ../x "$TMP/cr-x.jsonl" | cr)"
