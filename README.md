@@ -240,6 +240,15 @@ session is never alone: nothing is asked and nothing is typed, as with the
 user there. So it is while a scheduled wakeup, a monitor or a subagent is
 pending: none was tried across a `/clear`.
 
+So it is, too, while the tab's foreground process (`foregroundProcessId`) is
+not this session's Claude Code, read once all else says alone. A background
+session, which Claude Code's supervisor runs in a pty of its own, keeps the
+Konsole address of the shell it was dispatched from, and that tab shows
+another process. Until 0.10.2 such a session was asked for the handoff, told
+that ctx would type `/clear`, and `bin/auto-reset` then stopped at its first
+check: 4 of the 13 resets started over 2026-09-27..30 (ekko task 975). The ask
+it is spared is logged as `handoff-quiet` with `tab` `other`.
+
 Before each keystroke, `bin/auto-reset` checks that the tab's foreground
 process is this session's Claude Code, that the user has typed nothing since
 it started, and that the screen (`getAllDisplayedText`) shows the session

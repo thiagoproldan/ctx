@@ -40,7 +40,7 @@ let
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "ctx";
-  version = "0.10.1";
+  version = "0.10.2";
 
   src = ./src;
 

@@ -578,24 +578,32 @@ stop() {
   stop_json "$1" "$TMP/tr-$1.jsonl" "${3:-false}" "${4:-0}" | ho
 }
 # A process named claude stands for Claude Code: the ancestor hooks/handoff
-# looks for.
+# looks for, and the tab's foreground process, which a busctl playing Konsole
+# reports: the pid in $SOLO/fg.
 SOLO="$TMP/solo"
 mkdir -p "$SOLO" && ln -sf "$(command -v bash)" "$SOLO/claude"
+cat >"$SOLO/busctl" <<EOF
+#!$(command -v bash)
+[ "\$*" = "--user call fake.konsole /Sessions/7 org.kde.konsole.Session foregroundProcessId" ] || exit 1
+echo "i \$(cat "$SOLO/fg")"
+EOF
+chmod +x "$SOLO/busctl"
 # solo <session> <tokens> [stop_hook_active] [background tasks] [VAR=value...]
 # -- the hook in a Konsole tab of an interactive session, under a process named
 # claude, the user's last prompt ${AWAY:-40} minutes old and the turn after it
 # ended a minute later, or ENDED minutes ago (empty: no turn has ended since):
-# alone once that end is CTX_AUTO_RESET_IDLE (10) minutes old.
+# alone once that end is CTX_AUTO_RESET_IDLE (10) minutes old. The process
+# named claude is the tab's foreground, or the pid FG names.
 solo() {
   local s="$1" t="$2" a="${3:-false}" n="${4:-0}" away="${AWAY:-40}"
   shift 2
   shift $(($# < 2 ? $# : 2))
   transcript "$TMP/tr-$s.jsonl" "$t" "$away" "${ENDED-$((away > 0 ? away - 1 : 0))}"
-  # shellcheck disable=SC2016 # $0 is the hook, for the inner shell
+  # shellcheck disable=SC2016 # $0 is the hook, $1 the tab's foreground, for the inner shell
   stop_json "$s" "$TMP/tr-$s.jsonl" "$a" "$n" |
     env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H -u CTX_AUTO_RESET_IDLE \
       PATH="$SOLO:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
-      CLAUDE_CODE_ENTRYPOINT=cli "$@" "$SOLO/claude" -c '"$0"; true' "$HO" 2>&1
+      CLAUDE_CODE_ENTRYPOINT=cli "$@" "$SOLO/claude" -c 'echo "${FG:-$$}" >"$1"; "$0"; true' "$HO" "$SOLO/fg" 2>&1
 }
 # is <name> <ask|quiet> <output> -- empty output is quiet, the Stop context an
 # ask, anything else PARSE-ERR (never quiet by accident).
@@ -623,6 +631,7 @@ spared() { grep -c "\"ev\":\"handoff-quiet\",\"sid\":\"$1\"" "$CTX_STATE/handoff
 is "200k: quiet" quiet "$(stop a 200000)"
 is "the user there, 260k: quiet" quiet "$(stop a 260000)"
 eq "...counted as an ask spared" 1 "$(spared a)"
+has "...no tab named" absent '"tab"' "$(grep '"sid":"a"' "$CTX_STATE/handoff.jsonl")"
 is "...300k, the same band: quiet" quiet "$(stop a 300000)"
 eq "...counted once a band" 1 "$(spared a)"
 is "...510k, the next band: quiet" quiet "$(stop a 510000)"
@@ -639,6 +648,15 @@ is "...the turn ended 5 minutes ago: quiet" quiet "$(ENDED=5 solo w 300000)"
 out=$(solo w 300000)
 is "...the turn ended 39 minutes ago: asks" ask "$out"
 has "...away counted from the turn's end" present "away for 39 minutes" "$out"
+# A tab whose foreground is another process is not this session's to type into
+# (ekko task 975): a background session, which Claude Code's supervisor runs in
+# a pty of its own, keeps the Konsole address of the shell it was dispatched
+# from, and that tab shows something else. Away, such a session is not alone.
+out=$(FG=1 solo fg 300000)
+is "away, another process in the tab's foreground: quiet" quiet "$out"
+has "...counted as spared, the tab named" present '"tab":"other"' \
+  "$(grep '"ev":"handoff-quiet","sid":"fg"' "$CTX_STATE/handoff.jsonl")"
+is "...Claude Code in the foreground: asks" ask "$(solo fg 300000)"
 out=$(solo b 260000)
 is "...40 minutes ago, the same band: asks" ask "$out"
 has "names the context and the threshold" present "260k tokens, past the 250k" "$out"
@@ -1082,14 +1100,17 @@ has "...logged" present "the user typed" "$(said s-a5)"
 
 # The Stop hook decides; run under a process named claude, as Claude Code runs it.
 # stop_auto <session> <stop json> [env...] -- the hook's output, in a Konsole tab
-# of an interactive session unless the env says otherwise.
+# of an interactive session unless the env says otherwise. The process named
+# claude is the tab's foreground, as Claude Code is in its own tab, or the pid
+# FG names.
 stop_auto() {
   local j="$2"
   shift 2
   # shellcheck disable=SC2016 # $0 is the hook, for the inner shell
   printf '%s' "$j" | env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H -u CTX_AUTO_RESET_IDLE \
     PATH="$FAKEBIN:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
-    CTX_AUTO_RESET_WAIT=4 CLAUDE_CODE_ENTRYPOINT=cli "$@" "$FAKEBIN/claude" -c '"$0"; true' "$HO" 2>&1
+    CTX_AUTO_RESET_WAIT=4 CLAUDE_CODE_ENTRYPOINT=cli "$@" "$FAKEBIN/claude" \
+    -c 'echo "${FG:-$$}" >"$FK/fg"; "$0"; true' "$HO" 2>&1
 }
 # fresh_handoff <session> <tokens> -- as hooks/handoff-written leaves it
 fresh_handoff() { mkdir -p "$CTX_STATE/handoff" && echo "$2" >"$CTX_STATE/handoff/$1.written"; }
@@ -1102,15 +1123,16 @@ settled() {
   said "$1"
 }
 
-FG=$$ tab h1
+tab h1
 rows "$TMP/ar-h1/s-h1.jsonl" 262000 human:40 end:39 note:1
 fresh_handoff s-h1 258000
 out=$(stop_auto s-h1 "$(stop_json s-h1 "$TMP/ar-h1/s-h1.jsonl" true 1)")
 is "alone, handoff fresh: quiet" quiet "$out"
 has "...the reset starts" present '"ev":"auto-reset-start","sid":"s-h1"' "$(cat "$CTX_STATE/handoff.jsonl")"
+# bin/auto-reset checks the tab's foreground against the pid the hook hands it.
 last=$(settled s-h1)
-has "...a hook of ours reaches the fake tab" present '"ev":"auto-reset-stop"' "$last"
-has "...and stops there: this shell is no Claude Code" present "not this session" "$last"
+has "...and runs through, handed Claude Code's pid" present '"ev":"auto-reset","sid":"s-h1","to":"fresh-' "$last"
+eq "...typing /clear and the prompt into the tab" "'' /clear \$'\\r' continuando \$'\\r' " "$(sent)"
 
 tab h2
 rows "$TMP/ar-h2/s-h2.jsonl" 262000 human:2 end:1
@@ -1152,6 +1174,19 @@ is "no origin in the transcript: never alone, nothing asked" quiet "$out"
 out=$(stop_auto s-h9 "$(stop_json s-h9 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-c")
 has "alone past the cap: the /clear, not 'continuando'" present "ctx types /clear into this session's tab, and not 'continuando'" "$out"
 has "...and what the cap asks" present "Past the cap the rest of the window is the user's reserve" "$out"
+
+# ekko task 975: h3's input, then h1's, with another process in the tab's
+# foreground. No ask, and no reset to stop at its first check.
+tab h11
+out=$(FG=1 stop_auto s-h11 "$(stop_json s-h11 "$TMP/ar-h3/s-h3.jsonl" false 1)")
+is "h3's, another process in the foreground: quiet" quiet "$out"
+has "...counted as spared, the tab named" present '"tab":"other"' "$(said s-h11)"
+tab h12
+rows "$TMP/ar-h12/s-h12.jsonl" 262000 human:40 end:39 note:1
+fresh_handoff s-h12 258000
+out=$(FG=1 stop_auto s-h12 "$(stop_json s-h12 "$TMP/ar-h12/s-h12.jsonl" true 1)")
+is "h1's, another process in the foreground: quiet" quiet "$out"
+has "...and no reset" absent '"sid":"s-h12"' "$(grep auto-reset "$CTX_STATE/handoff.jsonl")"
 
 # --- cold return (UserPromptSubmit) -------------------------------------------------
 # A prompt that comes back to a big session past the cache's hour is stopped

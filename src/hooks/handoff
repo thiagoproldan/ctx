@@ -38,7 +38,8 @@
 # task ran. Once a fresh handoff is written, it starts bin/auto-reset, which
 # types /clear and 'continuando' into the session's own Konsole tab. Alone
 # means only in Konsole, only in an interactive session (CLAUDE_CODE_ENTRYPOINT
-# cli), only past the threshold, and not while anything but a background shell
+# cli), only past the threshold, only while the tab's foreground process is
+# this session's Claude Code, and not while anything but a background shell
 # is pending: a scheduled wakeup, a monitor or a subagent was not tested
 # across a /clear. So the 5-hour cap by itself never asks, and never resets: a
 # reset costs the window, it does not spare it. Past the cap on the window
@@ -68,6 +69,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/lib/handoff.sh"
 # shellcheck source=../lib/window.sh
 . "$ROOT/lib/window.sh"
+# shellcheck source=../lib/konsole.sh
+. "$ROOT/lib/konsole.sh"
 
 input=$(cat)
 sid="" transcript="" active=false pending=0 unshelled=0
@@ -111,10 +114,18 @@ claude_pid() {
 }
 
 # Whether the session runs alone: the user away, in a Konsole tab ctx can type
-# into, nothing but background shells pending. Read only past the threshold,
-# where it can change what happens.
+# into, with this session's Claude Code in its foreground, nothing but
+# background shells pending. Read only past the threshold, where it can change
+# what happens; the tab, a D-Bus call, only once all else reads alone.
+#
+# A background session, which Claude Code's supervisor runs in a pty of its
+# own, keeps the Konsole address of the shell it was dispatched from, and that
+# tab shows another process (ekko task 975). Read as alone, it was asked for a
+# handoff that told it ctx would type /clear, and bin/auto-reset then stopped
+# at its first check, the same foreground: 4 of the 13 resets started over
+# 2026-09-27..30. Away there, the ask it is spared is logged with tab other.
 idle_min=$(int_or "${CTX_AUTO_RESET_IDLE:-}" 10)
-alone=0 away=0 cpid=""
+alone=0 away=0 cpid="" elsewhere=0
 if [ "$idle_min" -gt 0 ] && [ "$threshold" -gt 0 ] && [ "$tokens" -ge "$threshold" ] &&
   [ "$unshelled" -eq 0 ] && [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "cli" ] &&
   [ -n "${KONSOLE_DBUS_SERVICE:-}" ] && [ -n "${KONSOLE_DBUS_SESSION:-}" ] &&
@@ -124,7 +135,9 @@ if [ "$idle_min" -gt 0 ] && [ "$threshold" -gt 0 ] && [ "$tokens" -ge "$threshol
   ended=$(int_or "${ended:-}" 0)
   if [ "$known" = "1" ] && [ "$ended" -gt 0 ]; then
     away=$((($(date +%s) - ended) / 60))
-    [ "$away" -ge "$idle_min" ] && alone=1
+    if [ "$away" -ge "$idle_min" ]; then
+      if [ "$(ctx_konsole_foreground)" = "$cpid" ]; then alone=1; else elsewhere=1; fi
+    fi
   fi
 fi
 
@@ -184,7 +197,8 @@ record() {
 # With the user there, nothing is asked (see the top). The book keeps only
 # what came back down, so the ask is still owed once the user is away; the
 # quiet line comes once for each band and 5-hour state the ask would have come
-# at, re-armed once nothing is due. Alone, background shells are no reason to
+# at, and again if the user goes away from a tab showing another process,
+# re-armed once nothing is due. Alone, background shells are no reason to
 # wait.
 quiet="$STATE/handoff/$sid.quiet"
 if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; }; then
@@ -194,10 +208,12 @@ if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; }; th
   if [ "$alone" -eq 0 ] && { [ "$ask_tokens" -eq 1 ] || [ "$ask_5h" -eq 1 ]; }; then
     was_quiet=""
     [ -r "$quiet" ] && read -r was_quiet <"$quiet"
-    if [ "$was_quiet" != "$band $hot" ]; then
-      { mkdir -p "$STATE/handoff" && echo "$band $hot" >"$quiet"; } 2>/dev/null
+    if [ "$was_quiet" != "$band $hot $elsewhere" ]; then
+      { mkdir -p "$STATE/handoff" && echo "$band $hot $elsewhere" >"$quiet"; } 2>/dev/null
+      tab=()
+      [ "$elsewhere" -eq 1 ] && tab=(tab other away "$away")
       CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff-quiet "$sid" \
-        tokens "$tokens" five "$five" band "$band"
+        tokens "$tokens" five "$five" band "$band" "${tab[@]}"
     fi
   else
     rm -f -- "$quiet" 2>/dev/null
