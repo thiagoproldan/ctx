@@ -53,9 +53,11 @@ ctx_last_call() {
   echo "$out"
 }
 
-# ctx_last_human <transcript> [typed] -- "<epoch> <uuid> <known>": when the
-# user last typed into this session, in seconds, and that row's uuid; "0 - 1"
-# when no row is the user's, "0 - 0" when the transcript cannot tell.
+# ctx_last_human <transcript> [typed] -- "<epoch> <uuid> <known> <ended>": when
+# the user last typed into this session, in seconds, and that row's uuid; "0 -
+# 1" when no row is the user's, "0 - 0" when the transcript cannot tell.
+# <ended> is when the first turn after that row ended, in seconds: 0 while
+# none has, and the user has seen nothing to answer yet.
 #
 # A prompt the user typed, a suggestion they accepted and a slash command carry
 # origin.kind "human"; a background task's notification ("task-notification")
@@ -65,6 +67,14 @@ ctx_last_call() {
 # <typed>, and they are passed over. <known> is 0 when no user row carries an
 # origin at all -- a transcript from a Claude Code that does not write it --
 # so that a missing field never reads as an absent user.
+#
+# A turn's end is the system row "turn_duration" Claude Code writes once the
+# turn is over, right after the Stop hooks; a stop a hook continues writes none
+# (ekko task 967). Measured on 2026-09-29 over 171 transcripts of Claude Code
+# 2.1.280-2.1.284: of 594 stops ctx did not continue, 531 were followed by one,
+# the shortest turn 0.8 s long; 61 ended a headless session with none, and 2
+# ran straight into a queued prompt. None of the 35 stops ctx continued was.
+# A Claude Code that writes none leaves <ended> at 0, which never reads as away.
 ctx_last_human() {
   local transcript="${1:-}" typed="${2:-}" skip='[]' out=""
   if [ -n "$typed" ] && [ -r "$typed" ]; then
@@ -72,18 +82,23 @@ ctx_last_human() {
   fi
   if [ -n "$transcript" ] && [ -r "$transcript" ]; then
     out=$(jq -nrR --argjson skip "$skip" '
-      reduce (inputs | fromjson? | objects | select(.type == "user")) as $r
-        ({at: 0, uuid: "-", known: 0};
-         if ($r.origin | type) == "object" then .known = 1 else . end
-         | if $r.origin.kind == "human" and ($r.uuid // "" | IN($skip[]) | not) then
-             .at = ($r.timestamp // "" | tostring | sub("\\.[0-9]+"; "")
-                    | try fromdateiso8601 catch 0)
-             | .uuid = ($r.uuid // "-" | tostring)
-           else . end)
-      | "\(.at | floor) \(.uuid) \(.known)"
+      def epoch: . // "" | tostring | sub("\\.[0-9]+"; "") | try fromdateiso8601 catch 0;
+      reduce (inputs | fromjson? | objects
+              | select(.type == "user" or (.type == "system" and .subtype == "turn_duration"
+                                           and .isSidechain != true))) as $r
+        ({at: 0, uuid: "-", known: 0, ended: 0};
+         if $r.type == "system" then
+           (if .ended == 0 then .ended = ($r.timestamp | epoch) else . end)
+         else
+           (if ($r.origin | type) == "object" then .known = 1 else . end)
+           | if $r.origin.kind == "human" and ($r.uuid // "" | IN($skip[]) | not) then
+               .at = ($r.timestamp | epoch) | .uuid = ($r.uuid // "-" | tostring) | .ended = 0
+             else . end
+         end)
+      | "\(.at | floor) \(.uuid) \(.known) \(.ended | floor)"
     ' <"$transcript" 2>/dev/null)
   fi
-  [[ "$out" =~ ^[0-9]+\ [^[:space:]]+\ [01]$ ]] || out="0 - 0"
+  [[ "$out" =~ ^[0-9]+\ [^[:space:]]+\ [01]\ [0-9]+$ ]] || out="0 - 0 0"
   echo "$out"
 }
 

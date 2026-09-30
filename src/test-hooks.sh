@@ -544,15 +544,19 @@ has "...and the call let through" present '"ev": "window-excepted"' "$(cat "$CTX
 # the calling shell has set.
 echo "handoff (Stop):"
 HO="$HOOKS/handoff"
-# transcript <file> <main-thread tokens> [minutes since the user typed] -- ends
-# with a bigger subagent reply and a line still being written, both of which
-# the hook must look past. Without the minutes no row carries an origin, and
-# the session never reads as away.
+# transcript <file> <main-thread tokens> [minutes since the user typed]
+# [minutes since the turn after it ended] -- ends with a bigger subagent reply
+# and a line still being written, both of which the hook must look past.
+# Without the first minutes no row carries an origin, and the session never
+# reads as away; without the second, no turn has ended since the user typed.
 transcript() {
-  jq -nc --argjson t "$2" --arg ago "${3:-}" '
+  jq -nc --argjson t "$2" --arg ago "${3:-}" --arg ended "${4:-}" '
     (if $ago == "" then empty else
       {type: "user", uuid: "typed", origin: {kind: "human"},
        timestamp: (now - ($ago | tonumber) * 60 | todate), message: {content: "oi"}} end),
+    (if $ended == "" then empty else
+      {type: "system", subtype: "turn_duration", durationMs: 1000,
+       timestamp: (now - ($ended | tonumber) * 60 | todate)} end),
     {type: "user", message: {content: "hi"}},
     {type: "assistant", message: {usage: {input_tokens: 2,
       cache_creation_input_tokens: 1000, cache_read_input_tokens: ($t - 1002)}}},
@@ -579,13 +583,14 @@ SOLO="$TMP/solo"
 mkdir -p "$SOLO" && ln -sf "$(command -v bash)" "$SOLO/claude"
 # solo <session> <tokens> [stop_hook_active] [background tasks] [VAR=value...]
 # -- the hook in a Konsole tab of an interactive session, under a process named
-# claude, the user's last prompt ${AWAY:-40} minutes old: alone, unless AWAY is
-# under CTX_AUTO_RESET_IDLE (10).
+# claude, the user's last prompt ${AWAY:-40} minutes old and the turn after it
+# ended a minute later, or ENDED minutes ago (empty: no turn has ended since):
+# alone once that end is CTX_AUTO_RESET_IDLE (10) minutes old.
 solo() {
-  local s="$1" t="$2" a="${3:-false}" n="${4:-0}"
+  local s="$1" t="$2" a="${3:-false}" n="${4:-0}" away="${AWAY:-40}"
   shift 2
   shift $(($# < 2 ? $# : 2))
-  transcript "$TMP/tr-$s.jsonl" "$t" "${AWAY:-40}"
+  transcript "$TMP/tr-$s.jsonl" "$t" "$away" "${ENDED-$((away > 0 ? away - 1 : 0))}"
   # shellcheck disable=SC2016 # $0 is the hook, for the inner shell
   stop_json "$s" "$TMP/tr-$s.jsonl" "$a" "$n" |
     env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H -u CTX_AUTO_RESET_IDLE \
@@ -626,6 +631,14 @@ stop a 120000 >/dev/null
 stop a 270000 >/dev/null
 eq "...compacted and past 250k again: counted again" 3 "$(spared a)"
 is "typed 1 minute ago, in Konsole: quiet" quiet "$(AWAY=1 solo b 260000)"
+# Away counts from the first turn end after the user's prompt, not from the
+# prompt (ekko task 967): a turn the user watches is no time away, however
+# long it runs.
+is "a turn running 40 minutes since the prompt: quiet" quiet "$(ENDED='' solo w 300000)"
+is "...the turn ended 5 minutes ago: quiet" quiet "$(ENDED=5 solo w 300000)"
+out=$(solo w 300000)
+is "...the turn ended 39 minutes ago: asks" ask "$out"
+has "...away counted from the turn's end" present "away for 39 minutes" "$out"
 out=$(solo b 260000)
 is "...40 minutes ago, the same band: asks" ask "$out"
 has "names the context and the threshold" present "260k tokens, past the 250k" "$out"
@@ -835,8 +848,9 @@ done
 eq "--any, a box not at the ❯ prompt" waits \
   "$(printf '✻ Crunched for 1s · done\n%s\n! ls\n%s\n  ctx 15k\n' "$RULE" "$RULE" | ctx_screen_idle --any >/dev/null && echo types || echo waits)"
 
-# rows <file> <tokens> <row>... -- a transcript: each row human:<minutes ago>[:uuid]
-# or note:<minutes ago> (a background task's notification), then a
+# rows <file> <tokens> <row>... -- a transcript: each row human:<minutes ago>[:uuid],
+# note:<minutes ago> (a background task's notification) or end:<minutes ago>
+# (a turn's end, as Claude Code marks it; side-end, a subagent's), then a
 # main-thread call of <tokens>.
 rows() {
   local f="$1" t="$2" r kind ago uuid
@@ -845,14 +859,26 @@ rows() {
   for r in "$@"; do
     IFS=: read -r kind ago uuid <<<"$r"
     jq -nc --arg k "$kind" --argjson a "$ago" --arg u "${uuid:-u$RANDOM}" '
-      {type: "user", uuid: $u,
-       origin: {kind: (if $k == "human" then "human" else "task-notification" end)},
-       timestamp: (now - $a * 60 | todate), message: {content: "x"}}' >>"$f"
+      (now - $a * 60 | todate) as $ts
+      | if $k == "end" or $k == "side-end" then
+          {type: "system", subtype: "turn_duration", durationMs: 1000, timestamp: $ts,
+           isSidechain: ($k == "side-end")}
+        else
+          {type: "user", uuid: $u,
+           origin: {kind: (if $k == "human" then "human" else "task-notification" end)},
+           timestamp: $ts, message: {content: "x"}}
+        end' >>"$f"
   done
   jq -nc --argjson t "$t" '{type: "assistant", message: {usage: {input_tokens: 2,
     cache_creation_input_tokens: 1000, cache_read_input_tokens: ($t - 1002)}}}' >>"$f"
 }
-ago() { read -r at _ known <<<"$(ctx_last_human "$@")"; [ "$known" = 1 ] && echo $((($(date +%s) - at) / 60)) || echo unknown; }
+ago() { read -r at _ known _ <<<"$(ctx_last_human "$@")"; [ "$known" = 1 ] && echo $((($(date +%s) - at) / 60)) || echo unknown; }
+# seen <transcript> [typed] -- minutes since the first turn after the user's
+# last prompt ended; none while no turn has.
+seen() {
+  read -r _ _ known ended <<<"$(ctx_last_human "$@")"
+  [ "$known" = 1 ] && [ "$ended" -gt 0 ] && echo $((($(date +%s) - ended) / 60)) || echo none
+}
 rows "$TMP/p1.jsonl" 1000 human:30 note:5 note:1
 eq "the user typed 30m ago; notifications since" 30 "$(ago "$TMP/p1.jsonl")"
 rows "$TMP/p2.jsonl" 1000 human:30 human:2:mine note:1
@@ -860,12 +886,22 @@ echo mine >"$TMP/p2.typed"
 eq "ctx's own typing is passed over" 30 "$(ago "$TMP/p2.jsonl" "$TMP/p2.typed")"
 transcript "$TMP/p3.jsonl" 1000
 eq "no origin on any row: unknown, never away" unknown "$(ago "$TMP/p3.jsonl")"
+rows "$TMP/p4.jsonl" 1000 human:30 end:29 note:5 end:4
+eq "the first turn end after the prompt counts" 29 "$(seen "$TMP/p4.jsonl")"
+rows "$TMP/p5.jsonl" 1000 human:30 end:29 human:3
+eq "a turn end before the last prompt: none" none "$(seen "$TMP/p5.jsonl")"
+rows "$TMP/p6.jsonl" 1000 human:30 side-end:20
+eq "a subagent's turn end: none" none "$(seen "$TMP/p6.jsonl")"
+rows "$TMP/p7.jsonl" 1000 human:30 end:29 human:2:mine end:1
+echo mine >"$TMP/p7.typed"
+eq "ctx's own typing: the end after the user's prompt" 29 "$(seen "$TMP/p7.jsonl" "$TMP/p7.typed")"
 
 # The fake tab. State in $FK: box (the input box), sent (each sendText, %q),
 # current (the transcript an Enter appends to), suggest (a prompt suggestion,
 # shown while the box is empty, as Claude Code does), and flags deny, busy,
-# dialog, meddle (the user types a 'u' after each text ctx types) and restless
-# (the box changes at every reading).
+# dialog, meddle (the user types a 'u' after each text ctx types), restless
+# (the box changes at every reading) and enter (the user presses Enter right
+# after ctx's first backspace).
 FAKEBIN="$TMP/fakebin"
 mkdir -p "$FAKEBIN"
 cat >"$FAKEBIN/busctl" <<EOF
@@ -903,7 +939,13 @@ case "\${args[4]}" in
     case "\$t" in
       '') ;;
       \$'\x15') : >"\$F/box" ;;
-      \$'\x7f') b=\$(cat "\$F/box"); printf '%s' "\${b%?}" >"\$F/box" ;;
+      \$'\x7f') b=\$(cat "\$F/box"); printf '%s' "\${b%?}" >"\$F/box"
+        if [ -e "\$F/enter" ]; then
+          rm -f "\$F/enter"
+          b=\$(cat "\$F/box"); : >"\$F/box"
+          jq -nc --arg c "\$b" '{type: "user", uuid: "user-row", origin: {kind: "human"},
+            timestamp: (now | todate), message: {content: \$c}}' >>"\$(cat "\$F/current")"
+        fi ;;
       \$'\r')
         b=\$(cat "\$F/box"); : >"\$F/box"
         if [ "\$b" = /clear ]; then
@@ -987,6 +1029,17 @@ eq "the user's half-typed text: /clear, taken back" "'' /clear $bs6" "$(sent)"
 eq "...the box as it was" "meio digitado" "$(cat "$FK/box")"
 has "...logged" present "taken back" "$(said s-a4)"
 
+# The user presses Enter one backspace into the take-back, as on 2026-09-29
+# (ekko task 967): the next reading sees the box changed, and no more
+# backspaces go.
+tab a10 enter
+printf 'o teste que vc rodou' >"$FK/box"
+rows "$TMP/ar-a10/s-a10.jsonl" 300000 human:40
+WAIT=3 reset_env "$AR" s-a10 "$TMP/ar-a10/s-a10.jsonl" $$
+eq "Enter one backspace in: no more backspaces" "'' /clear $(printf '%q ' $'\x7f')" "$(sent)"
+has "...logged as the box changing" present "the box changed after 1 of 6 backspaces" "$(said s-a10)"
+has "...not as taken back" absent "taken back" "$(said s-a10)"
+
 tab a6
 printf 'roda em segundo plano' >"$FK/suggest"
 rows "$TMP/ar-a6/s-a6.jsonl" 300000 human:40
@@ -1050,7 +1103,7 @@ settled() {
 }
 
 FG=$$ tab h1
-rows "$TMP/ar-h1/s-h1.jsonl" 262000 human:40 note:1
+rows "$TMP/ar-h1/s-h1.jsonl" 262000 human:40 end:39 note:1
 fresh_handoff s-h1 258000
 out=$(stop_auto s-h1 "$(stop_json s-h1 "$TMP/ar-h1/s-h1.jsonl" true 1)")
 is "alone, handoff fresh: quiet" quiet "$out"
@@ -1060,14 +1113,25 @@ has "...a hook of ours reaches the fake tab" present '"ev":"auto-reset-stop"' "$
 has "...and stops there: this shell is no Claude Code" present "not this session" "$last"
 
 tab h2
-rows "$TMP/ar-h2/s-h2.jsonl" 262000 human:2
+rows "$TMP/ar-h2/s-h2.jsonl" 262000 human:2 end:1
 fresh_handoff s-h2 258000
 stop_auto s-h2 "$(stop_json s-h2 "$TMP/ar-h2/s-h2.jsonl")" >/dev/null
 has "user typed 2m ago: no reset" absent '"sid":"s-h2","tokens"' \
   "$(grep auto-reset-start "$CTX_STATE/handoff.jsonl")"
 
+# The incident of 2026-09-29 (ekko task 967): the user's prompt 11 minutes old,
+# its turn not over -- the ask continued it, and a continued stop writes no
+# turn end -- and the handoff written. The user was watching, and writing the
+# next prompt: no reset.
+tab h10
+rows "$TMP/ar-h10/s-h10.jsonl" 271000 human:11
+fresh_handoff s-h10 270000
+out=$(stop_auto s-h10 "$(stop_json s-h10 "$TMP/ar-h10/s-h10.jsonl" true)")
+is "a watched turn 11 minutes in, handoff fresh: quiet" quiet "$out"
+has "...and no reset" absent '"ev":"auto-reset-start","sid":"s-h10"' "$(cat "$CTX_STATE/handoff.jsonl")"
+
 tab h3
-rows "$TMP/ar-h3/s-h3.jsonl" 262000 human:40 note:1
+rows "$TMP/ar-h3/s-h3.jsonl" 262000 human:40 end:39 note:1
 out=$(stop_auto s-h3 "$(stop_json s-h3 "$TMP/ar-h3/s-h3.jsonl" false 1)")
 is "alone, a shell running, no handoff: asks" ask "$out"
 has "...saying ctx types the /clear" present "ctx types /clear and 'continuando'" "$out"

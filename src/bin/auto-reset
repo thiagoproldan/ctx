@@ -21,7 +21,7 @@
 #  - the user has typed nothing into the session since this started.
 # Anything else ends it, logged in handoff.jsonl as auto-reset-stop, taking
 # back what it typed itself, a backspace a character, when nothing else
-# changed. Each wait -- for the turn to end, for the fresh session, for it to
+# changed: the box is read again before each backspace. Each wait -- for the turn to end, for the fresh session, for it to
 # settle -- lasts up to CTX_AUTO_RESET_WAIT seconds (300).
 #
 # Past the cap on the account's 5-hour window (lib/window.sh, ekko task 808),
@@ -117,9 +117,12 @@ holds_typed() {
 
 # press <text> -- type <text>; if the box then holds exactly it, Enter. A box
 # holding more held the user's own words, not a suggestion: what was typed is
-# taken back, a backspace a character, if nothing else changed there.
+# taken back, a backspace a character, each only while the box still holds the
+# user's words with what is left of the typing in them. On 2026-09-29 the user
+# pressed Enter one backspace in, and their prompt went out ending in '/clea'
+# (ekko task 967): now the next reading sees it, and the rest is not sent.
 press() {
-  local why after n
+  local why after n left
   ctx_konsole sendText s "$1" >/dev/null || stop "sendText refused"
   sleep 0.5
   if why=$(ctx_konsole_screen | ctx_screen_idle "$1"); then
@@ -128,10 +131,18 @@ press() {
   fi
   if after=$(ctx_konsole_screen | ctx_screen_idle --any) && holds_typed "$after" "$1" "$box"; then
     n=$(jq -rn --arg t "$1" '$t | length')
-    for _ in $(seq 1 "$n"); do
+    for i in $(seq 1 "$n"); do
+      left=$(jq -rn --arg t "$1" --argjson k "$((n - i + 1))" '$t[:$k]')
+      if [ "$i" -gt 1 ] && ! { after=$(ctx_konsole_screen | ctx_screen_idle --any) &&
+        holds_typed "$after" "$left" "$box"; }; then
+        stop "after typing '$1': $why; the box changed after $((i - 1)) of $n backspaces, and the rest were not sent"
+      fi
       ctx_konsole sendText s $'\x7f' >/dev/null
       sleep 0.15
     done
+    if ! { after=$(ctx_konsole_screen | ctx_screen_idle --any) && holds_typed "$after" "" "$box"; }; then
+      stop "after typing '$1': $why; taken back, but the box then held other text"
+    fi
     stop "after typing '$1': $why; taken back"
   fi
   stop "after typing '$1': $why; left as it was"

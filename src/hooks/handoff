@@ -21,9 +21,12 @@
 # /clear and the next session a few minutes of orientation).
 #
 # A session is alone when the user is away -- nothing typed for
-# CTX_AUTO_RESET_IDLE minutes (default 10; 0 turns this off), read off the
-# transcript by ctx_last_human -- and the user asked (ekko task 747) for the
-# ritual without them. Alone, it asks at most once per band: at
+# CTX_AUTO_RESET_IDLE minutes (default 10; 0 turns this off) since the first
+# turn after their last prompt ended, read off the transcript by ctx_last_human
+# -- and the user asked (ekko task 747) for the ritual without them. A turn the
+# user watches, however long, is no time away: counted from the prompt, a
+# 10-minute turn once made the user away at its end, and auto-reset typed
+# /clear into the next prompt they were writing (ekko task 967). Alone, it asks at most once per band: at
 # CTX_HANDOFF_TOKENS, again at twice that, and so on; a compaction that brings
 # the context back down re-arms the bands it came back under. Past the 5-hour
 # cap, CTX_HANDOFF_5H, the ask adds what the cap asks, once, and again only
@@ -116,10 +119,11 @@ if [ "$idle_min" -gt 0 ] && [ "$threshold" -gt 0 ] && [ "$tokens" -ge "$threshol
   [ "$unshelled" -eq 0 ] && [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "cli" ] &&
   [ -n "${KONSOLE_DBUS_SERVICE:-}" ] && [ -n "${KONSOLE_DBUS_SESSION:-}" ] &&
   cpid=$(claude_pid); then
-  at=0 known=0
-  read -r at _ known <<<"$(ctx_last_human "$transcript" "$STATE/auto/$sid.typed")"
-  if [ "$known" = "1" ]; then
-    away=$((($(date +%s) - at) / 60))
+  known=0 ended=0
+  read -r _ _ known ended <<<"$(ctx_last_human "$transcript" "$STATE/auto/$sid.typed")"
+  ended=$(int_or "${ended:-}" 0)
+  if [ "$known" = "1" ] && [ "$ended" -gt 0 ]; then
+    away=$((($(date +%s) - ended) / 60))
     [ "$away" -ge "$idle_min" ] && alone=1
   fi
 fi

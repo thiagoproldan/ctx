@@ -203,11 +203,21 @@ someone typed `/clear` and `continuando`. Now the same ritual runs without
 them, with no switch to remember: the session tells by itself whether the user
 is there.
 
-- **Away** means nothing typed for `CTX_AUTO_RESET_IDLE` minutes (10), read
-  off the transcript: a prompt the user typed carries `origin.kind` `human`,
-  while a background task's notification and a resume after a usage limit do
-  not, though both fire `UserPromptSubmit` like a typed prompt. A transcript
-  that carries no `origin` at all never reads as away.
+- **Away** means nothing typed for `CTX_AUTO_RESET_IDLE` minutes (10) since
+  the first turn after the user's last prompt ended, read off the transcript:
+  a prompt the user typed carries `origin.kind` `human`, while a background
+  task's notification and a resume after a usage limit do not, though both
+  fire `UserPromptSubmit` like a typed prompt. A transcript that carries no
+  `origin` at all never reads as away.
+- A turn the user watches is no time away, however long it runs. Counted from
+  the prompt, a 10-minute turn once made the user away at its end, while they
+  were writing the next prompt, and `/clear` was typed into it (ekko task
+  967). A turn's end is the `turn_duration` row Claude Code writes once the
+  turn is over; a stop a hook continues writes none. On 2026-09-29, over 171
+  transcripts of Claude Code 2.1.280–2.1.284, 531 of the 594 stops ctx did not
+  continue were followed by one; 61 ended a headless session, 2 ran straight
+  into a queued prompt, and none of the 35 stops ctx continued was. A Claude
+  Code that writes none never reads as away.
 - Away, past the threshold, the Stop hook asks for the handoff even with
   background shells running, and has Claude name each in it with its output
   file: a `/clear` does not stop them, and their notifications reach the fresh
@@ -243,7 +253,13 @@ Enter typed into one would approve the call. What was measured on 2026-09-26
   suggestion, and adds to the user's text. So the box may hold any text that
   stays the same for two readings in a row; once typed into, it must hold
   exactly what was typed, or what was typed is taken back, a backspace a
-  character, when nothing else changed there, and the reset stops.
+  character, when nothing else changed there, and the reset stops. The box is
+  read again before each backspace, so a key or an Enter of the user's ends
+  the take-back where it stands, and the log says so. On 2026-09-29 the user
+  pressed Enter one backspace in: the prompt went out ending in `/clea`, five
+  more backspaces followed, and the log said `taken back`. A draft the user
+  leaves in the box for 10 minutes after a turn has ended still looks like a
+  suggestion, and is still typed into.
 - A long text sent with its Enter in one `sendText` is taken as a paste, and
   the Enter becomes a newline, so each Enter goes alone, half a second later.
 
