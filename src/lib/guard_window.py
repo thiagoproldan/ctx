@@ -57,8 +57,8 @@ def main():
     until = datetime.datetime.fromtimestamp(resets).strftime("%H:%M")
     reason = (
         f"ctx refused {what}: the 5-hour window is at {five}%, past the {cap}% cap, until {until}. "
-        "Past the cap the rest of the window is the user's reserve: finish the step at hand, write "
-        "the handoff, and start nothing new."
+        "Past the cap the rest of the window is the user's reserve: finish the step at hand and "
+        "start nothing new."
     )
     refused = deny(reason, event)
     log("window-refuse" if refused else "window-excepted", sid, rule, call, cwd)

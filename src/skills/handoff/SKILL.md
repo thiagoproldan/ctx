@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: Write the ekko handoff before a /clear, when you pick the moment -- the same ask ctx's Stop hook makes past the context threshold.
+description: Write the ekko handoff before a /clear, when you pick the moment -- the same ask ctx's Stop hook makes of a session left alone past the context threshold.
 disable-model-invocation: true
 ---
 

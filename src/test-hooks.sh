@@ -535,15 +535,24 @@ has "refusals are logged" present '"ev": "window-refuse"' "$(cat "$CTX_STATE/gua
 has "...and the call let through" present '"ev": "window-excepted"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 
 # --- handoff (Stop) -----------------------------------------------------------------
-# Past the threshold the turn stays open once, with the ask as context for
-# Claude; below it, or once asked for that band, the hook says nothing. The
-# defaults are what is tested, whatever the calling shell has set.
+# With the user there, the hook asks nothing, past the threshold or the cap: the
+# status line flags the handoff, and the user runs /handoff between tasks (ekko
+# task 961). A session running alone -- the user away, in a Konsole tab of an
+# interactive session -- is asked once a band, with the ask as context for
+# Claude, and ctx then types the reset. Below the threshold, or once asked for
+# that band, the hook says nothing. The defaults are what is tested, whatever
+# the calling shell has set.
 echo "handoff (Stop):"
 HO="$HOOKS/handoff"
-# transcript <file> <main-thread tokens> -- ends with a bigger subagent reply
-# and a line still being written, both of which the hook must look past.
+# transcript <file> <main-thread tokens> [minutes since the user typed] -- ends
+# with a bigger subagent reply and a line still being written, both of which
+# the hook must look past. Without the minutes no row carries an origin, and
+# the session never reads as away.
 transcript() {
-  jq -nc --argjson t "$2" '
+  jq -nc --argjson t "$2" --arg ago "${3:-}" '
+    (if $ago == "" then empty else
+      {type: "user", uuid: "typed", origin: {kind: "human"},
+       timestamp: (now - ($ago | tonumber) * 60 | todate), message: {content: "oi"}} end),
     {type: "user", message: {content: "hi"}},
     {type: "assistant", message: {usage: {input_tokens: 2,
       cache_creation_input_tokens: 1000, cache_read_input_tokens: ($t - 1002)}}},
@@ -557,11 +566,31 @@ stop_json() {
      stop_hook_active: $a, session_crons: [],
      background_tasks: [range($n) | {id: "t\(.)", type: "shell", status: "running"}]}'
 }
-ho() { env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H "$@" "$HO" 2>&1; }
-# stop <session> <tokens> [stop_hook_active] [background tasks]
+ho() { env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H "$HO" 2>&1; }
+# stop <session> <tokens> [stop_hook_active] [background tasks] -- the user
+# there: no origin in the transcript, and no Konsole tab.
 stop() {
   transcript "$TMP/tr-$1.jsonl" "$2"
   stop_json "$1" "$TMP/tr-$1.jsonl" "${3:-false}" "${4:-0}" | ho
+}
+# A process named claude stands for Claude Code: the ancestor hooks/handoff
+# looks for.
+SOLO="$TMP/solo"
+mkdir -p "$SOLO" && ln -sf "$(command -v bash)" "$SOLO/claude"
+# solo <session> <tokens> [stop_hook_active] [background tasks] [VAR=value...]
+# -- the hook in a Konsole tab of an interactive session, under a process named
+# claude, the user's last prompt ${AWAY:-40} minutes old: alone, unless AWAY is
+# under CTX_AUTO_RESET_IDLE (10).
+solo() {
+  local s="$1" t="$2" a="${3:-false}" n="${4:-0}"
+  shift 2
+  shift $(($# < 2 ? $# : 2))
+  transcript "$TMP/tr-$s.jsonl" "$t" "${AWAY:-40}"
+  # shellcheck disable=SC2016 # $0 is the hook, for the inner shell
+  stop_json "$s" "$TMP/tr-$s.jsonl" "$a" "$n" |
+    env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H -u CTX_AUTO_RESET_IDLE \
+      PATH="$SOLO:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
+      CLAUDE_CODE_ENTRYPOINT=cli "$@" "$SOLO/claude" -c '"$0"; true' "$HO" 2>&1
 }
 # is <name> <ask|quiet> <output> -- empty output is quiet, the Stop context an
 # ask, anything else PARSE-ERR (never quiet by accident).
@@ -582,10 +611,23 @@ is() {
     [ -n "$out" ] && printf '        %s\n' "$(printf '%s' "$out" | head -3)"
   fi
 }
+ledger() { cat "$CTX_STATE/handoff.jsonl" 2>/dev/null; }
+# spared <session> -- the asks the user was spared, as the ledger counts them
+spared() { grep -c "\"ev\":\"handoff-quiet\",\"sid\":\"$1\"" "$CTX_STATE/handoff.jsonl" 2>/dev/null; }
 
 is "200k: quiet" quiet "$(stop a 200000)"
-out=$(stop a 260000)
-is "260k: asks" ask "$out"
+is "the user there, 260k: quiet" quiet "$(stop a 260000)"
+eq "...counted as an ask spared" 1 "$(spared a)"
+is "...300k, the same band: quiet" quiet "$(stop a 300000)"
+eq "...counted once a band" 1 "$(spared a)"
+is "...510k, the next band: quiet" quiet "$(stop a 510000)"
+eq "...and counted" 2 "$(spared a)"
+stop a 120000 >/dev/null
+stop a 270000 >/dev/null
+eq "...compacted and past 250k again: counted again" 3 "$(spared a)"
+is "typed 1 minute ago, in Konsole: quiet" quiet "$(AWAY=1 solo b 260000)"
+out=$(solo b 260000)
+is "...40 minutes ago, the same band: asks" ask "$out"
 has "names the context and the threshold" present "260k tokens, past the 250k" "$out"
 has "asks for the ekko handoff" present "write a handoff (kind handoff)" "$out"
 has "tells the user about /clear" present "/clear" "$out"
@@ -598,33 +640,31 @@ has "the ask is /handoff's own text" present "$(sed '/^---$/,/^---$/d' "$skill" 
   "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext' 2>/dev/null)"
 has "/handoff is the user's alone" present "disable-model-invocation: true" "$(cat "$skill" 2>/dev/null)"
 has "a subagent's 900k is not the context" absent "900k" "$out"
-is "same band again (300k): quiet" quiet "$(stop a 300000)"
-is "next band (510k): asks again" ask "$(stop a 510000)"
-is "compacted to 120k: quiet" quiet "$(stop a 120000)"
-is "past 250k again after compaction: asks" ask "$(stop a 270000)"
-is "stop hook already continuing: quiet" quiet "$(stop b 300000 true)"
-is "...and the ask is still owed" ask "$(stop b 300000)"
-is "background task running: quiet" quiet "$(stop c 300000 false 1)"
-has "...marked, for the cold-return hook" present "c.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
-is "...asked at the next idle stop" ask "$(stop c 300000)"
-has "...and the mark gone" absent "c.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
+is "alone, the same band again (300k): quiet" quiet "$(solo b 300000)"
+is "alone, the next band (510k): asks again" ask "$(solo b 510000)"
+is "alone, compacted to 120k: quiet" quiet "$(solo b 120000)"
+is "alone, past 250k again after compaction: asks" ask "$(solo b 270000)"
+is "stop hook already continuing: quiet" quiet "$(solo c 300000 true)"
+is "...and the ask is still owed" ask "$(solo c 300000)"
+is "the user there, a background task running: quiet" quiet "$(stop d 300000 false 1)"
+has "...marked, for the cold-return hook" present "d.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
+is "...and once it ended: quiet" quiet "$(stop d 300000)"
+has "...and the mark gone" absent "d.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
 is "continued stop, task running: quiet" quiet "$(stop e 300000 true 1)"
 has "...marked all the same" present "e.scheduled" "$(ls "$CTX_STATE/cold" 2>/dev/null)"
-is "missing transcript: quiet" quiet "$(stop_json d "$TMP/none.jsonl" | ho)"
+is "missing transcript: quiet" quiet "$(stop_json m0 "$TMP/none.jsonl" | ho)"
 transcript "$TMP/tr-x.jsonl" 300000
 is "session id with a slash: quiet" quiet "$(stop_json ../x "$TMP/tr-x.jsonl" | ho)"
-is "CTX_DISABLE=1: quiet" quiet "$(stop_json x "$TMP/tr-x.jsonl" | CTX_DISABLE=1 "$HO" 2>&1)"
-transcript "$TMP/tr-y.jsonl" 120000
-is "CTX_HANDOFF_TOKENS=100000: 120k asks" ask "$(stop_json y "$TMP/tr-y.jsonl" | ho CTX_HANDOFF_TOKENS=100000)"
-transcript "$TMP/tr-z.jsonl" 900000
-is "CTX_HANDOFF_TOKENS=0: 900k quiet" quiet "$(stop_json z "$TMP/tr-z.jsonl" | ho CTX_HANDOFF_TOKENS=0)"
+is "CTX_DISABLE=1, alone: quiet" quiet "$(solo x1 300000 false 0 CTX_DISABLE=1)"
+is "CTX_HANDOFF_TOKENS=100000, alone: 120k asks" ask "$(solo y 120000 false 0 CTX_HANDOFF_TOKENS=100000)"
+is "CTX_HANDOFF_TOKENS=0, alone: 900k quiet" quiet "$(solo z 900000 false 0 CTX_HANDOFF_TOKENS=0)"
 out=$(
   printf 'not json' | ho
   echo "rc=$?"
 )
 has "malformed input: exit 0" present "rc=0" "$out"
 has "malformed input: nothing printed" absent "{" "$out"
-has "each ask is logged" present '"ev":"handoff"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
+has "each ask is logged" present '"ev":"handoff"' "$(ledger)"
 
 # The 5-hour trigger reads the account's reading, which the status line leaves
 # (lib/window.sh); these sessions share an account of their own.
@@ -637,20 +677,49 @@ sl5() {
     env NO_COLOR=1 CLAUDE_CONFIG_DIR="$TMP/profile-5h" "$SL" >/dev/null
 }
 stop5() { CLAUDE_CONFIG_DIR="$TMP/profile-5h" stop "$@"; }
+solo5() { CLAUDE_CONFIG_DIR="$TMP/profile-5h" solo "$@"; }
 sl5 90.6
 has "status line leaves the account's 5h reading" present "90 " "$(cat "$CTX_STATE/window/profile-5h" 2>/dev/null)"
-out=$(stop5 f 50000)
-is "5h at 90%, small context: asks" ask "$out"
-has "names the 5-hour window" present "5-hour usage window is at 90%" "$out"
+is "the user there, 5h at 90%: quiet" quiet "$(stop5 f 300000)"
+has "...counted, with the 5-hour reading" present '"ev":"handoff-quiet","sid":"f","tokens":"300000","five":"90"' "$(ledger)"
+is "alone, small context, 5h at 90%: quiet" quiet "$(solo5 f2 50000)"
+out=$(solo5 h 300000)
+is "alone, 300k and 5h at 90%: asks" ask "$out"
+has "both triggers in one ask" present ", and the 5-hour" "$out"
+has "...names the 5-hour window" present "5-hour usage window is at 90%" "$out"
 has "...and what the cap asks" present "Past the cap the rest of the window is the user's reserve" "$out"
-is "5h still at 90%: quiet" quiet "$(stop5 f 50000)"
+is "alone, 5h still at 90%, the same band: quiet" quiet "$(solo5 h 300000)"
 sl5 40 2
-stop5 f 50000 >/dev/null
+solo5 h 300000 >/dev/null
 sl5 88 2
-is "a new window under 85%, then over: asks" ask "$(stop5 f 50000)"
+out=$(solo5 h 300000)
+is "a new window under 85%, then over: asks" ask "$out"
+has "...for the 5-hour window alone" absent "tokens, past the" "$out"
 mkdir -p "$CTX_STATE/window" && echo "95 $((now - 60)) -" >"$CTX_STATE/window/profile-ended"
-is "a reading whose window ended is ignored" quiet "$(CLAUDE_CONFIG_DIR="$TMP/profile-ended" stop g 50000)"
-has "both triggers in one ask" present ", and the 5-hour" "$(stop5 h 300000)"
+out=$(CLAUDE_CONFIG_DIR="$TMP/profile-ended" solo g 300000)
+is "alone, a reading whose window ended: the band's ask" ask "$out"
+has "...without the 5-hour window" absent "5-hour" "$out"
+
+# The rule over the class (ekko task 961): with the user there, nothing ctx
+# says past the threshold and the cap tells the model to write a handoff by
+# itself. Every output such a session gets there is enumerated -- the Stop
+# hook, the window hook at start, prompt and tool, the window guard's refusal
+# -- and the ask a session alone gets, which must say it, is the check's no.
+PK="$TMP/profile-k"
+CLAUDE_CONFIG_DIR="$PK" ctx_window_merge 95 "$at1" 40
+present_said=$(
+  CLAUDE_CONFIG_DIR="$PK" AWAY=1 solo k1 300000
+  for ev in start prompt tool; do
+    jq -nc --arg s "k-$ev" '{session_id: $s, source: "startup", prompt: "oi", tool_name: "Read"}' |
+      env -u CTX_DISABLE -u CTX_HANDOFF_5H CLAUDE_CONFIG_DIR="$PK" "$WH" "$ev" 2>&1
+  done
+  tool_json Agent | env -u CTX_DISABLE CLAUDE_CONFIG_DIR="$PK" EKKO_FAKE=refused "$HOOKS/guard-window" 2>&1
+)
+eq "the user there, past both: what is said" 4 "$(grep -o 'Past the cap' <<<"$present_said" | wc -l)"
+has "...the subagent refused among it" present "ctx refused a subagent" "$present_said"
+has "...and none of it asks for a handoff" absent "handoff" "$(tr '[:upper:]' '[:lower:]' <<<"$present_said")"
+has "alone, the ask does (the check's no)" present "handoff" \
+  "$(CLAUDE_CONFIG_DIR="$PK" solo k2 300000 | tr '[:upper:]' '[:lower:]')"
 
 # --- handoff written (PostToolUse) and its age ------------------------------------
 # Each handoff ekko accepts leaves the context it was written at, and nothing
@@ -697,20 +766,13 @@ out=$(
 )
 has "malformed input: exit 0" present "rc=0" "$out"
 
-# A fresh handoff holds the session: the Stop hook stays quiet and the band
-# counts as asked. A stale one, or one from before a compaction, does not.
+# Alone, a fresh handoff starts the reset instead of a second ask (see the auto
+# reset below); a stale one, or one from before a compaction, is asked again.
 mkdir -p "$CTX_STATE/handoff"
-printf '245000\n' >"$CTX_STATE/handoff/k.written"
-is "handoff at 245k, stop at 260k: quiet" quiet "$(stop k 260000)"
-is "...at 300k, stale but asked: quiet" quiet "$(stop k 300000)"
-has "a fresh handoff is logged" present '"ev":"handoff-fresh"' "$(cat "$CTX_STATE/handoff.jsonl" 2>/dev/null)"
-printf '100000\n' >"$CTX_STATE/handoff/m.written"
-is "handoff at 100k, stop at 260k: asks" ask "$(stop m 260000)"
-printf '400000\n' >"$CTX_STATE/handoff/n.written"
-is "handoff from before a compaction: asks" ask "$(stop n 260000)"
-sl5 90 2
-printf '45000\n' >"$CTX_STATE/handoff/q.written"
-is "5h at 90% with a fresh handoff: quiet" quiet "$(stop5 q 50000)"
+printf '100000\n' >"$CTX_STATE/handoff/hm.written"
+is "alone, handoff at 100k, stop at 260k: asks" ask "$(solo hm 260000)"
+printf '400000\n' >"$CTX_STATE/handoff/hn.written"
+is "alone, handoff from before a compaction: asks" ask "$(solo hn 260000)"
 
 # The status line gives the handoff's age in context: fresh under a tenth of
 # the threshold, stale past it.
@@ -1015,14 +1077,14 @@ is "present, a shell running: quiet, as before" quiet \
 cron_json=$(stop_json s-h4 "$TMP/ar-h3/s-h3.jsonl" | jq -c '.session_crons = [{id: "c1", schedule: "*/5 * * * *", recurring: true, prompt: "check"}]')
 is "alone, a wakeup scheduled: quiet" quiet "$(stop_auto s-h4 "$cron_json")"
 out=$(stop_auto s-h5 "$(stop_json s-h5 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CODE_ENTRYPOINT=sdk-cli)
-has "claude -p: the ask without the reset" absent "ctx types" "$out"
+is "claude -p: never alone, nothing asked" quiet "$out"
 out=$(stop_auto s-h6 "$(stop_json s-h6 "$TMP/ar-h3/s-h3.jsonl")" KONSOLE_DBUS_SESSION=)
-has "outside Konsole: the ask without the reset" absent "ctx types" "$out"
+is "outside Konsole: never alone, nothing asked" quiet "$out"
 out=$(stop_auto s-h7 "$(stop_json s-h7 "$TMP/ar-h3/s-h3.jsonl")" CTX_AUTO_RESET_IDLE=0)
-has "CTX_AUTO_RESET_IDLE=0: the ask without the reset" absent "ctx types" "$out"
+is "CTX_AUTO_RESET_IDLE=0: never alone, nothing asked" quiet "$out"
 transcript "$TMP/ar-h3/old.jsonl" 262000
 out=$(stop_auto s-h8 "$(stop_json s-h8 "$TMP/ar-h3/old.jsonl")")
-has "no origin in the transcript: never alone" absent "ctx types" "$out"
+is "no origin in the transcript: never alone, nothing asked" quiet "$out"
 out=$(stop_auto s-h9 "$(stop_json s-h9 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-c")
 has "alone past the cap: the /clear, not 'continuando'" present "ctx types /clear into this session's tab, and not 'continuando'" "$out"
 has "...and what the cap asks" present "Past the cap the rest of the window is the user's reserve" "$out"

@@ -3,8 +3,8 @@
 # called, the one text that asks for a handoff, and where a written handoff is
 # noted.
 #
-# The Stop hook (hooks/handoff) asks past the threshold, the user asks through
-# /handoff (skills/handoff), hooks/handoff-written notes each handoff ekko
+# The Stop hook (hooks/handoff) asks a session left alone past the threshold,
+# the user asks through /handoff (skills/handoff), hooks/handoff-written notes each handoff ekko
 # writes, so that the status line can say how old it is, and hooks/cold-return
 # points at it when a prompt would re-write an expired cache.
 

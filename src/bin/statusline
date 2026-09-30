@@ -14,9 +14,12 @@
 #
 # It also leaves the account's 5-hour reading where the hooks find it
 # (lib/window.sh): no hook's input carries the rate limits, and the status
-# line is the only place Claude Code hands them out. The Stop hook asks for
-# the handoff past the cap on it, hooks/window tells the model where it
-# stands, and hooks/guard-window refuses new work past the cap (ekko task 808).
+# line is the only place Claude Code hands them out. The Stop hook adds the
+# cap to the handoff it asks of a session left alone, hooks/window tells the
+# model where it stands, and hooks/guard-window refuses new work past the cap
+# (ekko task 808). With the user there, the flag below is the only cue: the
+# Stop hook asks nothing, and the moment is the user's /handoff (ekko task
+# 961).
 #
 # Once this session has written a handoff (hooks/handoff-written notes the
 # context it was written at), the context segment says how old it is:

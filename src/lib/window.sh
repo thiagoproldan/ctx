@@ -4,9 +4,11 @@
 #
 # The user's words, 2026-09-26: tell the model where the 5-hour limit stands,
 # and put a cap at 85%, leaving 15% for emergencies or anything else. The cap
-# is CTX_HANDOFF_5H (default 85; 0 turns it off), the same number at which the
-# Stop hook asks for the handoff: past it a session writes its handoff and
-# starts nothing new, and the rest of the window is the user's.
+# is CTX_HANDOFF_5H (default 85; 0 turns it off), the same number past which a
+# session running alone is asked for its handoff (hooks/handoff): past it a
+# session starts nothing new, and the rest of the window is the user's. With
+# the user there, nothing tells the model to write a handoff by itself (ekko
+# task 961): that is the user's /handoff.
 #
 # Only the status line is handed the rate limits: no hook's input carries
 # them (Claude Code 2.1.283). So bin/statusline leaves a reading where every
@@ -118,5 +120,5 @@ ctx_window_line() {
 
 # ctx_window_rule -- what the cap asks of a session past it.
 ctx_window_rule() {
-  echo "Past the cap the rest of the window is the user's reserve: finish the step at hand, write the handoff, and start nothing new -- no subagent, no headless claude, no new schedule, which ctx refuses. A prompt the user sends goes through: do what it asks, and nothing more."
+  echo "Past the cap the rest of the window is the user's reserve: finish the step at hand and start nothing new -- no subagent, no headless claude, no new schedule, which ctx refuses. A prompt the user sends goes through: do what it asks, and nothing more."
 }

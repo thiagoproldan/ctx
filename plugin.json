@@ -1,7 +1,7 @@
 {
   "name": "ctx",
   "version": "@version@",
-  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, and past a context threshold asks for an ekko handoff before the turn ends, then shows how old it is; with the user away, types the /clear and 'continuando' into the session's Konsole tab itself; stops once a prompt that would re-write a big expired cache; and tells the model where the account's 5-hour window stands, refusing past its cap the new work a session starts on its own.",
+  "description": "Keeps Claude Code's context small: routes bulk reads and boilerplate to a cheap non-Claude worker (Gemini via agy, sandboxed), blocks commands that would dump big files into context, flags on the status line when the context warrants an ekko handoff, and how old the last one is; with the user away, asks for the handoff before the turn ends and types the /clear and 'continuando' into the session's Konsole tab itself; stops once a prompt that would re-write a big expired cache; and tells the model where the account's 5-hour window stands, refusing past its cap the new work a session starts on its own.",
   "homepage": "https://github.com/thiagoproldan/ctx",
   "hooks": {
     "PreToolUse": [

@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# Stop: past the handoff threshold, keep the turn open once and ask Claude for
-# the handoff, so the user can /clear with nothing lost.
+# Stop: with the user away, past the handoff threshold, keep the turn open once
+# and ask Claude for the handoff, which bin/auto-reset then clears into a fresh
+# session. With the user there, ask nothing: the status line flags the handoff
+# from the threshold on, and the user runs /handoff between tasks.
+#
+# Asking the user who is there held a turn at whatever point the work had
+# reached (ekko task 961). Of 30 such asks over 2026-09-23..29, 18 were
+# followed by a prompt that went on with the work, and 12 ended the session.
+# Claude Code's documentation puts /clear between unrelated tasks, which only
+# the user can tell apart. Claude Code's compaction (autoCompactWindow, ~417k
+# here) stays the safety net for a user who never clears. Each ask the user
+# was spared is logged as handoff-quiet, once a band, to keep the count.
 #
 # The status line has said "ctx Nk ⚑ handoff" since 2026-09-15, and the clears
 # still came late and by eye: at 199k, 349k, 356k, 506k and 719k of context on
@@ -10,35 +20,33 @@
 # of what 200k saves with ~30% fewer resets (each reset costs the user a
 # /clear and the next session a few minutes of orientation).
 #
-# It asks at most once per band: at CTX_HANDOFF_TOKENS, again at twice that,
-# and so on; a compaction that brings the context back down re-arms the bands
-# it came back under. The 5-hour window past CTX_HANDOFF_5H asks once, and
-# again only after the window has come back under it. Never while a stop hook
-# is already continuing the turn, and not while background work or a scheduled
-# wakeup would resume the session with the user there: it asks at the next
-# stop instead. A /clear does not drop a background shell -- its notification
-# reaches the fresh session (measured 2026-09-26, ekko gotcha 777) -- but the
-# fresh session gets it without knowing why the task ran.
-#
-# When the user is away -- nothing typed for CTX_AUTO_RESET_IDLE minutes
-# (default 10; 0 turns this off), read off the transcript by ctx_last_human --
-# the session runs alone, and the user asked (ekko task 747) for the same
-# ritual without them: past the threshold it asks for the handoff even with
-# background shells running, telling Claude to name them in it; and once a
-# fresh handoff is written, it starts bin/auto-reset, which types /clear and
-# 'continuando' into the session's own Konsole tab. Only in Konsole, only in
-# an interactive session (CLAUDE_CODE_ENTRYPOINT cli), and not while anything
-# but a background shell is pending: a scheduled wakeup, a monitor or a
-# subagent was not tested across a /clear. The 5-hour trigger never resets: a
+# A session is alone when the user is away -- nothing typed for
+# CTX_AUTO_RESET_IDLE minutes (default 10; 0 turns this off), read off the
+# transcript by ctx_last_human -- and the user asked (ekko task 747) for the
+# ritual without them. Alone, it asks at most once per band: at
+# CTX_HANDOFF_TOKENS, again at twice that, and so on; a compaction that brings
+# the context back down re-arms the bands it came back under. Past the 5-hour
+# cap, CTX_HANDOFF_5H, the ask adds what the cap asks, once, and again only
+# after the window has come back under it. Never while a stop hook is already
+# continuing the turn. It asks even with background shells running, telling
+# Claude to name them in the handoff: a /clear does not drop a background
+# shell -- its notification reaches the fresh session (measured 2026-09-26,
+# ekko gotcha 777) -- but the fresh session gets it without knowing why the
+# task ran. Once a fresh handoff is written, it starts bin/auto-reset, which
+# types /clear and 'continuando' into the session's own Konsole tab. Alone
+# means only in Konsole, only in an interactive session (CLAUDE_CODE_ENTRYPOINT
+# cli), only past the threshold, and not while anything but a background shell
+# is pending: a scheduled wakeup, a monitor or a subagent was not tested
+# across a /clear. So the 5-hour cap by itself never asks, and never resets: a
 # reset costs the window, it does not spare it. Past the cap on the window
 # (ekko task 808) bin/auto-reset types the /clear and not 'continuando': the
 # fresh session waits for the user, whose reserve the rest of the window is.
 #
-# Nor when a handoff this session wrote is still fresh: less than a tenth of
-# the threshold of context since (hooks/handoff-written notes each one). The
-# user who ran /handoff at 240k does not want a second one at 250k; the band
-# counts as asked. The ask itself is the body of skills/handoff/SKILL.md, the
-# text /handoff sends, so the two never drift apart.
+# Alone, a handoff this session wrote that is still fresh -- less than a tenth
+# of the threshold of context since (hooks/handoff-written notes each one) --
+# starts the reset instead of a second ask. The ask itself is the body of
+# skills/handoff/SKILL.md, the text /handoff sends, so the two never drift
+# apart.
 #
 # The context is the last main-thread call's input, read from the end of the
 # transcript (input + cache writes + cache reads); the 5-hour reading is the
@@ -169,12 +177,26 @@ record() {
   printf '%s %s\n' "$1" "$2" >"$book" 2>/dev/null || true
 }
 
-# Pending work defers the ask while the user is there to ask at the next
-# stop; alone, background shells are no reason to wait (see the top).
-if { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; } ||
-  { [ "$pending" -gt 0 ] && [ "$alone" -eq 0 ]; }; then
+# With the user there, nothing is asked (see the top). The book keeps only
+# what came back down, so the ask is still owed once the user is away; the
+# quiet line comes once for each band and 5-hour state the ask would have come
+# at, re-armed once nothing is due. Alone, background shells are no reason to
+# wait.
+quiet="$STATE/handoff/$sid.quiet"
+if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; }; then
   if [ "$last_band" != "$was_band" ] || [ "$last_hot" != "$was_hot" ]; then
     record "$last_band" "$last_hot"
+  fi
+  if [ "$alone" -eq 0 ] && { [ "$ask_tokens" -eq 1 ] || [ "$ask_5h" -eq 1 ]; }; then
+    was_quiet=""
+    [ -r "$quiet" ] && read -r was_quiet <"$quiet"
+    if [ "$was_quiet" != "$band $hot" ]; then
+      { mkdir -p "$STATE/handoff" && echo "$band $hot" >"$quiet"; } 2>/dev/null
+      CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff-quiet "$sid" \
+        tokens "$tokens" five "$five" band "$band"
+    fi
+  else
+    rm -f -- "$quiet" 2>/dev/null
   fi
   exit 0
 fi
@@ -186,14 +208,6 @@ record "$last_band" "$last_hot"
 # account's (ctx 0.7.0 and earlier).
 find "$STATE/sessions" "$STATE/handoff" "$STATE/window/told" -type f -mtime +7 -delete 2>/dev/null
 
-# A handoff written moments ago already holds the session: the band counts as
-# asked, and the status line shows how fresh the handoff is.
-if [ -n "$written" ] && [ "$tokens" -ge "$written" ] &&
-  [ $((tokens - written)) -lt $((threshold / 10)) ]; then
-  CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff-fresh "$sid" \
-    tokens "$tokens" written "$written" band "$band"
-  exit 0
-fi
 
 k() { echo "$(($1 / 1000))k"; }
 why=""

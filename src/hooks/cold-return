@@ -14,8 +14,10 @@
 # fixed number of units -- 175k that day, 63-77k since (ekko task 809) -- so
 # the reason gives going on as a multiple of starting over. Under ~210k of
 # context going on is the cheaper, so 250k, the Stop hook's threshold, is the
-# value to turn it on with. The handoff is mostly there by then: the Stop hook
-# asks for one at each band, and /handoff at the user's moment. /handoff pays
+# value to turn it on with. A handoff may be there by then: /handoff at the
+# user's moment, which the status line flags from the threshold on, or the
+# Stop hook's ask to a session left alone (since 0.10.0, ekko task 961, it
+# asks nothing of a user who is there). /handoff pays
 # the same rewrite, so the reason says it, even when the handoff is fresh: both
 # stops of the first four days ended in /handoff and then the prompt sent again
 # (ekko task 540).

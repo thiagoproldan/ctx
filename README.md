@@ -18,8 +18,10 @@ Two ideas:
 - **A long session pays for its whole context on every call.** Re-reading the
   context is most of the bill; a handoff to the board and a `/clear` drop it.
 
-What the plugin adds to both is _enforcement_: hooks block the big read, and
-hold the turn for the handoff, instead of trusting someone to remember.
+What the plugin adds to both is _enforcement_: hooks block the big read,
+instead of trusting someone to remember. The handoff is the user's to time,
+between tasks, and the status line flags when it is due; a session left alone
+is held for it, and cleared into a fresh one.
 
 Installed from this flake into every Claude Code profile, as a skills-directory
 plugin, the same way ekko is.
@@ -48,12 +50,12 @@ plugin, the same way ekko is.
      so on turn zero.
    - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
      block, for the funnel.
-   - `handoff` — `Stop`: past `CTX_HANDOFF_TOKENS` of context (250k), or the
-     5-hour window past its cap, `CTX_HANDOFF_5H` (85%), keeps the turn open
-     once and asks for the ekko handoff and a `/clear` — unless a handoff the
-     session wrote moments before already holds it. With the user away, it has
-     `bin/auto-reset` type the `/clear` and `continuando` into the session's
-     Konsole tab (see _A session left alone_).
+   - `handoff` — `Stop`: with the user away, past `CTX_HANDOFF_TOKENS` of
+     context (250k), keeps the turn open once and asks for the ekko handoff,
+     then has `bin/auto-reset` type the `/clear` and `continuando` into the
+     session's Konsole tab (see _A session left alone_). With the user there it
+     asks nothing: the status line flags the handoff, and the user runs
+     `/handoff` (see _The handoff_).
    - `handoff-written` — `PostToolUse` on ekko's `create` and `batch`: notes the
      context at which the session wrote a handoff, so its age can be shown.
    - `cold-return` — `UserPromptSubmit`, off by default: with `CTX_COLD_TOKENS`
@@ -65,8 +67,8 @@ plugin, the same way ekko is.
    `ctx-report` and `ctx-test` measure and verify; `ctx-statusline` draws the
    status line.
 3. **Skills** — `bulk-reader` and `code-writer` say when and how to call them.
-   `handoff` is the user's alone (`/handoff`): the Stop hook's ask, at a moment
-   the user picks.
+   `handoff` is for the user only (`/handoff`): the handoff at a moment the
+   user picks, in the text the Stop hook asks a session left alone with.
 
 ## The handoff
 
@@ -82,33 +84,43 @@ nuance a reset loses: none, or ten extra calls each), about 90% of what 200k
 saves with about 30% fewer resets — and each reset costs the user a `/clear`
 and the next session a few minutes of orientation. Hence the default.
 
-At the end of each turn, the `handoff` hook:
+Until 0.10.0 the hook asked whoever was there, at whatever point the work had
+reached. Of its 30 asks over 2026-09-23..29 with the user there, 18 were
+followed by a prompt that went on with the work, and 12 ended the session
+(ekko task 961). Claude Code's own advice is a `/clear` between unrelated
+tasks, and only the user can tell where one ends. So with the user there the
+hook asks nothing: the status line flags the handoff from the threshold on,
+and the user runs `/handoff` and `/clear` between tasks. Claude Code's
+compaction (`autoCompactWindow`, ~417k here) stays the net under a session
+that is never cleared.
 
-- reads the context from the end of the transcript: the last main-thread
-  call's input, cache writes and cache reads. A subagent's replies do not
-  count, and neither does a line still being written;
-- past the threshold, keeps the turn open once — as `additionalContext`, which
-  Claude Code shows as _Stop hook feedback_, not as an error — asking first for
-  typed ekko notes (decision, gotcha, procedure) for whatever later sessions
-  must keep, then for the handoff on the task in progress: where it stopped,
-  what was decided and why, the files, the notes the next session must read in
-  full, by id, and the next step as an action the next session takes at once,
-  without exploring first. Then one line telling the user to `/clear`;
+At the end of each turn, the `handoff` hook reads the context from the end of
+the transcript: the last main-thread call's input, cache writes and cache
+reads. A subagent's replies do not count, and neither does a line still being
+written. With the user there, it asks nothing, and logs each ask it spared,
+once, to `$CTX_STATE/handoff.jsonl` as `handoff-quiet`. With the user away
+(see _A session left alone_), it:
+
+- past the threshold, keeps the turn open once — as `additionalContext`,
+  which Claude Code shows as _Stop hook feedback_, not as an error — asking
+  first for typed ekko notes (decision, gotcha, procedure) for whatever later
+  sessions must keep, then for the handoff on the task in progress: where it
+  stopped, what was decided and why, the files, the notes the next session
+  must read in full, by id, and the next step as an action the next session
+  takes at once, without exploring first. Then one line telling the user to
+  `/clear`, which ctx types itself;
 - asks once per band: at T, again at 2T, 3T…; a compaction re-arms the bands
-  it came back under;
-- asks when the 5-hour window passes its cap, `CTX_HANDOFF_5H`, once, re-armed
-  when a later window comes in under it. It reads the account's reading (see
-  _The 5-hour cap_), and past the cap the ask adds what the cap asks: start
-  nothing new;
-- stays quiet while a stop hook is already continuing the turn, and, with the
-  user there, while background work or a scheduled wakeup would resume the
-  session: it asks at the next stop instead. A `/clear` does not drop a
-  background shell — its notification reaches the fresh session (measured
-  2026-09-26) — but the fresh session gets it without knowing why it ran;
-- stays quiet, and counts the band as asked, while a handoff this session wrote
-  is fresh: less than a tenth of the threshold of context since it;
-- logs each ask, and each one a fresh handoff spared, to
-  `$CTX_STATE/handoff.jsonl`.
+  it came back under. A band crossed with the user there is still owed, and
+  asked once the user is away;
+- past the threshold, asks again when the 5-hour window passes its cap,
+  `CTX_HANDOFF_5H`, once, re-armed when a later window comes in under it. It
+  reads the account's reading (see _The 5-hour cap_), and past the cap the
+  ask adds what the cap asks: start nothing new. The cap by itself asks
+  nothing;
+- stays quiet while a stop hook is already continuing the turn;
+- once a handoff this session wrote is fresh — less than a tenth of the
+  threshold of context since it — starts the reset instead of a second ask;
+- logs each ask to `$CTX_STATE/handoff.jsonl`.
 
 The ask is the body of `skills/handoff/SKILL.md`, which is also what `/handoff`
 sends: one text, so the hook and the command cannot drift apart.
@@ -175,7 +187,9 @@ of 100k or more after an hour idle, against 7 in the 3.1 days before, while
 the returns after an hour kept coming, to sessions of 34-81k. Where the guard
 did stop a prompt, it saved nothing. What would bring it back is those
 rewrites coming back, from a session auto-reset cannot reach, such as one in
-the background: `CTX_COLD_TOKENS=250000` turns it on.
+the background: `CTX_COLD_TOKENS=250000` turns it on. Since 0.10.0 the Stop
+hook no longer asks a user who is there for the handoff (_The handoff_), which
+may bring some back; ekko task 941's recount keeps the two periods apart.
 
 In a folder without an ekko board, the ask only tells the user. ekko needs
 nothing new for this: the handoff is an ekko note of kind `handoff`, which the
@@ -211,9 +225,10 @@ and its hooks inherit. Konsole 26.08 refuses typed input over D-Bus unless
 DBus API** is on (`[KonsoleWindow] EnableSecuritySensitiveDBusAPI=true` in
 `konsolerc`), and with it on, any process of the user can type into any tab.
 An empty `sendText` tells which, typing nothing. Elsewhere — another
-terminal, tmux, `claude -p` (`CLAUDE_CODE_ENTRYPOINT` other than `cli`) — the
-ask is as before and nothing is typed. So it is while a scheduled wakeup, a
-monitor or a subagent is pending: none was tried across a `/clear`.
+terminal, tmux, `claude -p` (`CLAUDE_CODE_ENTRYPOINT` other than `cli`) — a
+session is never alone: nothing is asked and nothing is typed, as with the
+user there. So it is while a scheduled wakeup, a monitor or a subagent is
+pending: none was tried across a `/clear`.
 
 Before each keystroke, `bin/auto-reset` checks that the tab's foreground
 process is this session's Claude Code, that the user has typed nothing since
@@ -243,9 +258,11 @@ waits for the user, whose reserve the rest of the window is.
 
 The user, 2026-09-26: tell the model where the 5-hour limit stands, cap it at
 85%, and keep the last 15% for emergencies or anything else. The cap is
-`CTX_HANDOFF_5H` (85; 0 turns it off), the same number at which the Stop hook
-asks for the handoff: past it, a session writes its handoff and starts nothing
-new, and the rest of the window is the user's.
+`CTX_HANDOFF_5H` (85; 0 turns it off), also where the status line flags the
+handoff (`5h 87% ⚑ handoff`): past it, a session starts nothing new, and the
+rest of the window is the user's. Nothing tells the model to write a handoff
+by itself: that is the user's `/handoff`, and the Stop hook's ask to a session
+left alone (_The handoff_).
 
 **The reading.** Only the status line is handed the rate limits; no hook's
 input carries them (Claude Code 2.1.283). So `ctx-statusline` leaves one
@@ -541,7 +558,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_WORKER_HOME`       | `$CTX_STATE/worker-home`  | The worker's own home, holding its `agy` login                     |
 | `GRAPHIFY_OUT`          | `graphify-out`            | Read, never set here — honours graphify's own                      |
 | `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
-| `CTX_HANDOFF_5H`        | `85`                      | The cap on the 5-hour window: a handoff, then no new work (0 off)  |
+| `CTX_HANDOFF_5H`        | `85`                      | The cap on the 5-hour window: no new work past it (0 off)          |
 | `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
 | `CTX_COLD_TOKENS`       | `0`                       | Cold-return hook: context worth stopping a prompt for (0 off)      |
 | `CTX_COLD_MINUTES`      | `60`                      | Cold-return hook: idle minutes that make the cache cold (0 off)    |
