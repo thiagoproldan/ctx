@@ -12,11 +12,21 @@ LIVE=0
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# The worker's login, for --live: where the caller's settings put it, read
+# before the next lines drop them.
+REAL_WORKER_HOME="${CTX_WORKER_HOME:-${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}/worker-home}"
+# Every case runs under ctx's defaults, whatever its caller set. Run from a
+# session configured with CTX_HANDOFF_5H=95, 15 cases that expect the default
+# cap of 85% failed against hooks that held. A case that wants another value
+# sets it on its own call. The build runs the suite with every CTX_ variable
+# the code reads set to 1 (package.nix): without this line, 254 cases fail.
+# shellcheck disable=SC2046 # variable names: one word each, no glob
+unset $(compgen -v CTX_)
+
 # Ledger isolation. Without this the suite writes to the PRODUCTION funnel: the
 # first real run dumped 32 fixture blocks into funnel.jsonl and the report began
 # showing "32 ignored" — the instrument corrupting exactly what it measures.
 # Exported, so it holds for every hook called here.
-REAL_WORKER_HOME="${CTX_WORKER_HOME:-${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}/worker-home}"
 export CTX_STATE="$TMP/state"
 export CTX_FUNNEL="$TMP/funnel-suite.jsonl"
 export CTX_LEDGER="$TMP/usage-suite.jsonl"
@@ -78,7 +88,7 @@ verdict() {
 # check <name> <expected: deny|allow> <hook> <input json>
 check() {
   local name="$1" want="$2" hook="$3" json="$4" out got
-  out=$(printf '%s' "$json" | env -u CTX_DISABLE CTX_MIN_LINES=500 "$HOOKS/$hook" 2>&1)
+  out=$(printf '%s' "$json" | env CTX_MIN_LINES=500 "$HOOKS/$hook" 2>&1)
   got=$(verdict "$out")
   if [ "$got" = "$want" ]; then
     pass=$((pass + 1))
@@ -102,7 +112,7 @@ check "900 lines with offset/limit" allow check-file-size "$(read_slice "$TMP/bi
 check "missing file" allow check-file-size "$(read_json "$TMP/missing.ts")"
 check "big binary (.png)" allow check-file-size "$(read_json "$TMP/big.png")"
 check "tool_input without file_path" allow check-file-size '{"tool_name":"Read","tool_input":{}}'
-out=$(printf '%s' "$(read_json "$TMP/big.ts")" | env -u CTX_DISABLE -u CTX_MIN_LINES "$HOOKS/check-file-size")
+out=$(printf '%s' "$(read_json "$TMP/big.ts")" | "$HOOKS/check-file-size")
 got=$(verdict "$out")
 if [ "$got" = "deny" ]; then
   pass=$((pass + 1))
@@ -178,7 +188,7 @@ reason() {
   p="${extra_path:+$extra_path:}$PATH"
   [ "$extra_path" = "PURE" ] && p="$PUREBIN"
   printf '%s' "$(read_json "$file")" |
-    env -u CTX_DISABLE PATH="$p" \
+    env PATH="$p" \
       CTX_MIN_LINES=500 "$HOOKS/check-file-size" 2>&1 |
     jq -r '.hookSpecificOutput.permissionDecisionReason // ""'
 }
@@ -258,7 +268,7 @@ has "absolute GRAPHIFY_OUT honoured" present "graphify query" "$out"
 # The Bash hook reuses the same hint on its denial path.
 mv "$PROJ/graphify-out-feature" "$PROJ/graphify-out"
 out=$(printf '%s' "$(bash_json "cd $PROJ/src/deep/deeper && cat big.ts")" |
-  env -u CTX_DISABLE PATH="$FAKEBIN:$PATH" CTX_MIN_LINES=500 "$HOOKS/check-bash-read" |
+  env PATH="$FAKEBIN:$PATH" CTX_MIN_LINES=500 "$HOOKS/check-bash-read" |
   jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
 has "bash denial carries the graph hint too" present "$PROJ/graphify-out/graph.json" "$out"
 
@@ -269,7 +279,7 @@ ann() {
   local p="${2:+$2:}$PATH"
   [ "${2:-}" = "PURE" ] && p="$PUREBIN"
   jq -nc --arg c "$1" '{hook_event_name:"SessionStart",cwd:$c,session_id:"t"}' |
-    env -u CTX_DISABLE PATH="$p" "$HOOKS/announce-graph" 2>&1
+    env PATH="$p" "$HOOKS/announce-graph" 2>&1
 }
 echo "session announcement:"
 has "with graph, announces" present "graphify query" "$(ann "$PROJ/src" "$FAKEBIN")"
@@ -309,7 +319,7 @@ has "inside a repo: upward path" present "This project has a graph" "$(ann "$REP
 echo "track-usage (PostToolUse) and block logging:"
 FUN="$TMP/funnel.jsonl"
 : >"$FUN"
-trk() { printf '%s' "$1" | env -u CTX_DISABLE CTX_FUNNEL="$FUN" "$HOOKS/track-usage" >/dev/null 2>&1; }
+trk() { printf '%s' "$1" | env CTX_FUNNEL="$FUN" "$HOOKS/track-usage" >/dev/null 2>&1; }
 evs() { jq -r '.ev' "$FUN" 2>/dev/null | tr '\n' ' '; }
 
 trk "$(jq -nc '{session_id:"s",tool_name:"Bash",tool_input:{command:"graphify query \"x\" --graph /g.json"}}')"
@@ -328,14 +338,14 @@ for h in check-file-size check-bash-read; do
   : >"$FUN"
   in=$(jq -nc --arg p "$TMP/big.ts" '{session_id:"sb",tool_name:"Read",tool_input:{file_path:$p}}')
   [ "$h" = check-bash-read ] && in=$(jq -nc --arg c "cat $TMP/big.ts" '{session_id:"sb",tool_name:"Bash",tool_input:{command:$c}}')
-  printf '%s' "$in" | env -u CTX_DISABLE CTX_FUNNEL="$FUN" CTX_MIN_LINES=500 "$HOOKS/$h" >/dev/null
+  printf '%s' "$in" | env CTX_FUNNEL="$FUN" CTX_MIN_LINES=500 "$HOOKS/$h" >/dev/null
   has "$h logs the block" present '"ev":"block"' "$(cat "$FUN")"
   has "$h block keeps the session" present '"sid":"sb"' "$(cat "$FUN")"
 done
 # And an allowed read must not dirty the funnel.
 : >"$FUN"
 printf '%s' "$(jq -nc --arg p "$TMP/small.ts" '{session_id:"sb",tool_name:"Read",tool_input:{file_path:$p}}')" |
-  env -u CTX_DISABLE CTX_FUNNEL="$FUN" CTX_MIN_LINES=500 "$HOOKS/check-file-size" >/dev/null
+  env CTX_FUNNEL="$FUN" CTX_MIN_LINES=500 "$HOOKS/check-file-size" >/dev/null
 has "allowed read records nothing" absent "block" "$(cat "$FUN")"
 
 # The report's correlation. Found in a real session: a denied Read, then a denied
@@ -458,7 +468,7 @@ PW="$TMP/profile-h"
 wh() {
   local ev="$1"
   shift
-  env -u CTX_DISABLE -u CTX_HANDOFF_5H CLAUDE_CONFIG_DIR="$PW" "$@" "$WH" "$ev" 2>&1
+  env CLAUDE_CONFIG_DIR="$PW" "$@" "$WH" "$ev" 2>&1
 }
 told() { printf '%s' "$1" | jq -r '.hookSpecificOutput.additionalContext // .reason // ""' 2>/dev/null; }
 held() { printf '%s' "$1" | jq -r '.decision // ""' 2>/dev/null; }
@@ -527,7 +537,7 @@ gw "another Bash call goes" allow guard-window "$(bash_json 'ls ~/.claude/projec
 gw "a Read goes" allow guard-window "$(tool_json Read)"
 CTX_HANDOFF_5H=0 gw "CTX_HANDOFF_5H=0: no cap" allow guard-window "$(tool_json Agent)"
 EKKO_FAKE=through gw "the user let it through in ekko's menu" allow guard-window "$(tool_json Agent)"
-out=$(tool_json Agent | env -u CTX_DISABLE CLAUDE_CONFIG_DIR="$PG" EKKO_FAKE=refused "$HOOKS/guard-window" |
+out=$(tool_json Agent | env CLAUDE_CONFIG_DIR="$PG" EKKO_FAKE=refused "$HOOKS/guard-window" |
   jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
 has "the reason names the window and the cap" present "the 5-hour window is at 85%, past the 85% cap, until $(date -d "@$at1" +%H:%M)" "$out"
 has "...and how to ask the user" present 'allow set to "abc123"' "$out"
@@ -570,7 +580,7 @@ stop_json() {
      stop_hook_active: $a, session_crons: [],
      background_tasks: [range($n) | {id: "t\(.)", type: "shell", status: "running"}]}'
 }
-ho() { env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H "$HO" 2>&1; }
+ho() { "$HO" 2>&1; }
 # stop <session> <tokens> [stop_hook_active] [background tasks] -- the user
 # there: no origin in the transcript, and no Konsole tab.
 stop() {
@@ -601,8 +611,7 @@ solo() {
   transcript "$TMP/tr-$s.jsonl" "$t" "$away" "${ENDED-$((away > 0 ? away - 1 : 0))}"
   # shellcheck disable=SC2016 # $0 is the hook, $1 the tab's foreground, for the inner shell
   stop_json "$s" "$TMP/tr-$s.jsonl" "$a" "$n" |
-    env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H -u CTX_AUTO_RESET_IDLE \
-      PATH="$SOLO:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
+    env PATH="$SOLO:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
       CLAUDE_CODE_ENTRYPOINT=cli "$@" "$SOLO/claude" -c 'echo "${FG:-$$}" >"$1"; "$0"; true' "$HO" "$SOLO/fg" 2>&1
 }
 # is <name> <ask|quiet> <output> -- empty output is quiet, the Stop context an
@@ -742,9 +751,9 @@ present_said=$(
   CLAUDE_CONFIG_DIR="$PK" AWAY=1 solo k1 300000
   for ev in start prompt tool; do
     jq -nc --arg s "k-$ev" '{session_id: $s, source: "startup", prompt: "oi", tool_name: "Read"}' |
-      env -u CTX_DISABLE -u CTX_HANDOFF_5H CLAUDE_CONFIG_DIR="$PK" "$WH" "$ev" 2>&1
+      env CLAUDE_CONFIG_DIR="$PK" "$WH" "$ev" 2>&1
   done
-  tool_json Agent | env -u CTX_DISABLE CLAUDE_CONFIG_DIR="$PK" EKKO_FAKE=refused "$HOOKS/guard-window" 2>&1
+  tool_json Agent | env CLAUDE_CONFIG_DIR="$PK" EKKO_FAKE=refused "$HOOKS/guard-window" 2>&1
 )
 eq "the user there, past both: what is said" 4 "$(grep -o 'Past the cap' <<<"$present_said" | wc -l)"
 has "...the subagent refused among it" present "ctx refused a subagent" "$present_said"
@@ -765,7 +774,7 @@ posted() {
   jq -nc --arg s "$1" --arg t "$TMP/tr-w-$1.jsonl" --arg n "$3" --argjson i "$4" --arg r "$5" '
     {session_id: $s, transcript_path: $t, hook_event_name: "PostToolUse",
      tool_name: $n, tool_input: $i, tool_response: [{type: "text", text: $r}]}' |
-    env -u CTX_DISABLE "$HW" 2>&1
+    "$HW" 2>&1
 }
 written() { cat "$CTX_STATE/handoff/$1.written" 2>/dev/null; }
 OK='{"ok":true,"items":[{"id":415}]}'
@@ -789,10 +798,10 @@ has "a later handoff moves the mark" present "350000" "$(written w1)"
 jq -nc --arg t "$TMP/tr-w-w1.jsonl" --arg n "$EC" --arg r "$OK" '
   {session_id: "../w7", transcript_path: $t, tool_name: $n,
    tool_input: {kind: "handoff"}, tool_response: [{type: "text", text: $r}]}' |
-  env -u CTX_DISABLE "$HW" >/dev/null 2>&1
+  "$HW" >/dev/null 2>&1
 has "session id with a slash: nothing written" absent "w7" "$(ls "$CTX_STATE" "$CTX_STATE/handoff")"
 out=$(
-  printf 'not json, but handoff' | env -u CTX_DISABLE "$HW"
+  printf 'not json, but handoff' | "$HW"
   echo "rc=$?"
 )
 has "malformed input: exit 0" present "rc=0" "$out"
@@ -999,7 +1008,7 @@ tab() {
   export FK
 }
 AR="$ROOT/bin/auto-reset"
-reset_env() { env -u CTX_DISABLE PATH="$FAKEBIN:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole \
+reset_env() { env PATH="$FAKEBIN:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole \
   KONSOLE_DBUS_SESSION=/Sessions/7 CTX_AUTO_RESET_WAIT="${WAIT:-4}" "$@"; }
 sent() { tr '\n' ' ' <"$FK/sent" 2>/dev/null; }
 said() { grep "\"sid\":\"$1\"" "$CTX_STATE/handoff.jsonl" 2>/dev/null | tail -1; }
@@ -1107,8 +1116,7 @@ stop_auto() {
   local j="$2"
   shift 2
   # shellcheck disable=SC2016 # $0 is the hook, for the inner shell
-  printf '%s' "$j" | env -u CTX_DISABLE -u CTX_HANDOFF_TOKENS -u CTX_HANDOFF_5H -u CTX_AUTO_RESET_IDLE \
-    PATH="$FAKEBIN:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
+  printf '%s' "$j" | env PATH="$FAKEBIN:$PATH" KONSOLE_DBUS_SERVICE=fake.konsole KONSOLE_DBUS_SESSION=/Sessions/7 \
     CTX_AUTO_RESET_WAIT=4 CLAUDE_CODE_ENTRYPOINT=cli "$@" "$FAKEBIN/claude" \
     -c 'echo "${FG:-$$}" >"$FK/fg"; "$0"; true' "$HO" 2>&1
 }
@@ -1215,7 +1223,7 @@ prompt_json() {
   jq -nc --arg s "$1" --arg t "$2" --arg p "${3:-go on}" '
     {session_id: $s, transcript_path: $t, hook_event_name: "UserPromptSubmit", prompt: $p}'
 }
-cr() { env -u CTX_DISABLE -u CTX_COLD_TOKENS -u CTX_COLD_MINUTES -u CTX_HANDOFF_TOKENS "$@" "$CR" 2>&1; }
+cr() { env "$@" "$CR" 2>&1; }
 on() { cr CTX_COLD_TOKENS=250000 "$@"; }
 # back <session> <tokens> <minutes idle> [prompt] -- a new transcript each time
 back() {
@@ -1277,7 +1285,7 @@ has "handoff from before a compaction: says so" present "from before a compactio
 has "three days away: in days" present "idle 3 days" "$(crwhy "$(back c8 344000 4320)")"
 has "530k: ~2.5 times" present "costs ~2.5 times what" "$(crwhy "$(back c9 530000 90)")"
 has "under 1, with a lower threshold: ~0.7 times" present "costs ~0.7 times what" \
-  "$(crwhy "$(ctr "$TMP/cr-c11.jsonl" 150000 90 && prompt_json c11 "$TMP/cr-c11.jsonl" | env -u CTX_DISABLE -u CTX_COLD_MINUTES -u CTX_HANDOFF_TOKENS CTX_COLD_TOKENS=100000 "$CR" 2>&1)")"
+  "$(crwhy "$(ctr "$TMP/cr-c11.jsonl" 150000 90 && prompt_json c11 "$TMP/cr-c11.jsonl" | env CTX_COLD_TOKENS=100000 "$CR" 2>&1)")"
 guarded "missing transcript: passes" pass "$(prompt_json d1 "$TMP/none.jsonl" | on)"
 ctr "$TMP/cr-x.jsonl" 344000 90
 guarded "session id with a slash: passes" pass "$(prompt_json ../x "$TMP/cr-x.jsonl" | on)"
@@ -1359,7 +1367,7 @@ wl "branch -d, git refuses itself" allow 'git branch -d feat'
 g push -q origin feat
 wl "branch -D, pushed" allow 'git branch -D feat'
 # wlwhy <command> -- the reason the guard gives, for a refusal.
-wlwhy() { printf '%s' "$(wl_json "$1")" | env -u CTX_DISABLE "$HOOKS/guard-work-loss" 2>&1; }
+wlwhy() { printf '%s' "$(wl_json "$1")" | "$HOOKS/guard-work-loss" 2>&1; }
 # A commit whose patch another branch holds, rebased or cherry-picked there, is
 # not lost with its branch (ekko task 891); one changed after the copy is, and
 # so is a merge, which has no patch of its own to match. main moves first: a
@@ -1522,7 +1530,7 @@ sb "bwrap --tmpfs over a secret root" allow "bwrap --tmpfs $SEC/persist --ro-bin
 readers=$(python3 -c "import sys; sys.path.insert(0, '$HOOKS/../lib'); import guard_secrets as g; print(' '.join(sorted(g.READERS - {'dd', 'openssl'})))")
 missed=""
 for r in $readers; do
-  out=$(sec_bash "$r API .env" | HOME="$SH" CTX_SECRET_ROOTS="$SEC/persist" env -u CTX_DISABLE "$HOOKS/guard-secrets")
+  out=$(sec_bash "$r API .env" | HOME="$SH" CTX_SECRET_ROOTS="$SEC/persist" "$HOOKS/guard-secrets")
   [ "$(verdict "$out")" = deny ] || missed+=" $r"
 done
 has "every reader in READERS refuses .env ($(wc -w <<<"$readers"))" absent " " "$missed"
@@ -1559,7 +1567,7 @@ has "a secret sent to a file goes to guard.jsonl" present '"ev": "secret-pass"' 
 echo "ekko's answer, before a guard refuses:"
 # ek <EKKO_FAKE> <hook> <input json>: the hook's output under that answer
 ek() {
-  printf '%s' "$3" | env -u CTX_DISABLE EKKO_FAKE="$1" EKKO_FAKE_LOG="$TMP/ekko.log" \
+  printf '%s' "$3" | env EKKO_FAKE="$1" EKKO_FAKE_LOG="$TMP/ekko.log" \
     CTX_GUARD_SCRATCH="$TMP/scratch" HOME="$SH" CTX_SECRET_ROOTS="$SEC/persist" "$HOOKS/$2" 2>&1
 }
 why() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecisionReason // ""'; }
@@ -1586,7 +1594,7 @@ eq "ekko says the user let it through: passes" allow "$(verdict "$out")"
 has "  logged as guard-excepted" present '"ev": "guard-excepted"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 out=$(ek mute guard-work-loss "$reset")
 eq "ekko fails without a word: refused as before" deny "$(verdict "$out")"
-out=$(printf '%s' "$reset" | env -u CTX_DISABLE PATH="$NOEKKO" CTX_GUARD_SCRATCH="$TMP/scratch" "$HOOKS/guard-work-loss" 2>&1)
+out=$(printf '%s' "$reset" | env PATH="$NOEKKO" CTX_GUARD_SCRATCH="$TMP/scratch" "$HOOKS/guard-work-loss" 2>&1)
 eq "no ekko on PATH: refused as before" deny "$(verdict "$out")"
 has "  and the reason gains nothing" absent "allow set to" "$(why "$out")"
 g checkout -q -- a.txt

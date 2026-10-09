@@ -542,7 +542,7 @@ ctx-code-write --spec "tests for X" --reference ref_test.py --target new_test.py
 ctx-report [--since 2026-09-08] [--until 2026-09-15]
 ctx-login [--force]
 ctx-statusline   # Claude Code runs it; reads the status-line JSON on stdin
-ctx-test [--live]
+ctx-test [--live]   # under ctx's defaults: the caller's CTX_ settings are dropped
 ```
 
 ## Status line

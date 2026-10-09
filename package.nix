@@ -40,7 +40,7 @@ let
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "ctx";
-  version = "0.10.2";
+  version = "0.10.3";
 
   src = ./src;
 
@@ -86,10 +86,15 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   '';
 
   # The hermetic suite runs against the installed, wrapped hooks: what ships is
-  # what was tested.
+  # what was tested. It runs with every CTX_ variable the code reads set to 1,
+  # which cases expecting the defaults would fail on (CTX_DISABLE, a 1% cap, a
+  # 1-line threshold), as a user's session sets some: the suite must drop them.
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
+    for v in $(grep -rhoIE 'CTX_[A-Z0-9_]+' hooks bin lib report.sh | sort -u); do
+      export "$v=1"
+    done
     HOME=$TMPDIR $out/bin/ctx-test
     runHook postInstallCheck
   '';
