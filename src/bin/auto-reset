@@ -5,7 +5,7 @@
 # 'continuando') into the fresh session. hooks/handoff starts it, detached,
 # when the user has been away CTX_AUTO_RESET_IDLE minutes.
 #
-# Usage: auto-reset <session id> <transcript> <Claude Code's pid>
+# Usage: auto-reset [--at-reset] <session id> <transcript> <Claude Code's pid>
 #
 # The user asked for it on 2026-09-26 (ekko task 747): a session left to run
 # alone stalled at the handoff, or went on paying for an ever larger context,
@@ -18,22 +18,40 @@
 #    typed into, holds exactly what was typed. The text it held before may be
 #    a prompt suggestion, which typing replaces, or the user's own, which
 #    typing adds to: on screen the two look the same (ekko gotcha 784);
-#  - the user has typed nothing into the session since this started.
+#  - the user has typed nothing into the session since this started or, with
+#    --at-reset, since the window reset.
 # Anything else ends it, logged in handoff.jsonl as auto-reset-stop, taking
 # back what it typed itself, a backspace a character, when nothing else
 # changed: the box is read again before each backspace. Each wait -- for the turn to end, for the fresh session, for it to
 # settle -- lasts up to CTX_AUTO_RESET_WAIT seconds (300).
 #
-# Past the cap on the account's 5-hour window or its week's (lib/window.sh,
-# ekko task 808), read as the fresh session comes up, it types the /clear and
-# not the prompt: the fresh session costs nothing while it waits, and the rest
-# of the window is the user's. Logged as auto-reset with held "cap" and the
-# window.
+# Past the cap on the account's 5-hour window (lib/window.sh, ekko task 808),
+# read as the fresh session comes up, it types the /clear, and the prompt only
+# once that window has reset, unless the user has typed into the fresh session
+# by then: it costs nothing while it waits, and the rest of the window is the
+# user's. Past the week's cap it types the /clear and not the prompt, logged
+# as auto-reset with held "cap": the week resets days later.
+#
+# With --at-reset there is no /clear. hooks/handoff starts it at a stop for
+# the 5-hour window -- past its cap, or from 70% of it with a fresh handoff --
+# and once that window ends it types the prompt into the same session, logged
+# as auto-resume, if no turn of the session ended after the reset and the
+# user has been away CTX_AUTO_RESET_IDLE minutes (10), read as hooks/handoff
+# reads it. A turn that ended after the reset, the user's or the session's
+# own, means the work went on without it. On 2026-10-02 a session that
+# stopped for the window waited for the user to come back and type, the
+# window long renewed (task 1 on ctx's board).
+#
+# Either wait reads the window every half minute at most, and ends, logged as
+# auto-reset-stop, when the tab's foreground changes, the week passes its cap
+# or a day has gone by.
 set -u
 
 [ "${CTX_DISABLE:-0}" = "1" ] && exit 0
 
 int_or() { case "${1:-}" in '' | *[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+at_reset=0
+[ "${1:-}" = "--at-reset" ] && at_reset=1 && shift
 sid="${1:-}" transcript="${2:-}" claude=$(int_or "${3:-}" 0)
 wait_s=$(int_or "${CTX_AUTO_RESET_WAIT:-}" 300)
 prompt="${CTX_AUTO_RESET_PROMPT:-continuando}"
@@ -45,6 +63,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/lib/ledger.sh"
 # shellcheck source=../lib/window.sh
 . "$ROOT/lib/window.sh"
+# shellcheck source=../lib/handoff.sh
+. "$ROOT/lib/handoff.sh"
+idle=$(($(int_or "${CTX_AUTO_RESET_IDLE:-}" 10) * 60))
 
 # The session id names files below: nothing that could leave the directory.
 case "$sid" in '' | */* | .*) exit 0 ;; esac
@@ -58,10 +79,19 @@ stop() {
 }
 
 # One at a time per session: the Stop hook fires again at every turn's end.
+# A lock whose process is gone (ctx_auto_busy) is taken over. A signal ends
+# this through the EXIT trap, and the lock with it: the long sleeps below run
+# in the background, waited for, so that a signal is not held until they end.
 mkdir -p "$STATE/auto" 2>/dev/null
 lock="$STATE/auto/$sid.lock"
-mkdir "$lock" 2>/dev/null || exit 0
-trap 'rmdir "$lock" 2>/dev/null' EXIT
+if ! mkdir "$lock" 2>/dev/null; then
+  ctx_auto_busy "$STATE" "$sid" && exit 0
+  rm -rf -- "$lock"
+  mkdir "$lock" 2>/dev/null || exit 0
+fi
+echo "$$" >"$lock/pid"
+trap 'rm -rf -- "$lock"' EXIT
+trap 'exit 0' TERM INT HUP
 
 ctx_konsole_writable || stop "Konsole refuses typed input over D-Bus (EnableSecuritySensitiveDBusAPI)"
 [ "$(ctx_konsole_foreground)" = "$claude" ] || stop "the tab's foreground process is not this session's Claude Code"
@@ -149,6 +179,131 @@ press() {
   stop "after typing '$1': $why; left as it was"
 }
 
+# wait_cap <transcript> <offset> -- wait while the 5-hour window is past its
+# cap: until its reading has ended or come in under both caps. A row the user
+# typed past <offset> ends it.
+begun=0 waited=0
+wait_cap() {
+  local five resets seven seven_resets hot now left
+  while :; do
+    [ "$(ctx_konsole_foreground)" = "$claude" ] || stop "the tab's foreground process changed"
+    [ "$(typed_since "$1" "$2")" = "true" ] && stop "the user typed into the session"
+    five="" resets="" seven="" seven_resets="" hot=""
+    read -r five resets seven seven_resets <<<"$(ctx_window)"
+    read -r hot _ <<<"$(ctx_window_hot "${five:-}" "${resets:-}" "${seven:--}" "${seven_resets:--}")"
+    case "${hot:-}" in
+    7d) stop "the week is past its cap" ;;
+    5h) ;;
+    *) return 0 ;;
+    esac
+    now=$(date +%s)
+    [ $((now - begun)) -lt 86400 ] || stop "still past the cap a day later"
+    # Half a minute at most, and no later than the window's end.
+    left=$((resets - now))
+    [ "$left" -gt 30 ] && left=30
+    [ "$left" -lt 1 ] && left=1
+    sleep "$left" &
+    wait $!
+  done
+}
+
+# turn_ended_after <transcript> <epoch> -- "true" when a turn of the session's
+# main thread ended after <epoch>.
+turn_ended_after() {
+  jq -nR --argjson t "$2" '
+    any(inputs | fromjson? | objects
+        | select(.type == "system" and .subtype == "turn_duration" and .isSidechain != true)
+        | .timestamp // "" | tostring | sub("\\.[0-9]+"; "") | try fromdateiso8601 catch 0;
+        . > $t)' <"$1" 2>/dev/null
+}
+# turn_ended_since <transcript> <offset> -- "true" when one did past <offset>
+# bytes.
+turn_ended_since() {
+  tail -c +"$(($2 + 1))" -- "$1" 2>/dev/null | jq -nR '
+    any(inputs | fromjson? | objects;
+        .type == "system" and .subtype == "turn_duration" and .isSidechain != true)' 2>/dev/null
+}
+
+# wait_resume <transcript> -- wait for the end of the 5-hour window read now,
+# if it is from 70% or past its cap (a few seconds otherwise: the window has
+# just reset); then until the user has been away $idle seconds, since the
+# first turn after their last prompt ended (ctx_last_human). A turn of the
+# session that ended after the reset, or a prompt of the user's, ends it: the
+# work went on without it. Half a minute at most between readings of the
+# window, five seconds once it has reset.
+wait_resume() {
+  local five resets seven seven_resets hot end now left known ended=0 off=""
+  read -r five resets seven seven_resets <<<"$(ctx_window)"
+  # The stop that started this writes its own turn's end just after.
+  end=$(($(date +%s) + 5))
+  case "$(ctx_window_band "${five:-}" "${seven:--}")" in
+  3) stop "the week is past its cap" ;;
+  1 | 2) [ "$resets" -gt "$end" ] && end=$resets ;;
+  esac
+  while :; do
+    [ "$(ctx_konsole_foreground)" = "$claude" ] || stop "the tab's foreground process changed"
+    five="" resets="" seven="" seven_resets="" hot=""
+    read -r five resets seven seven_resets <<<"$(ctx_window)"
+    read -r hot _ <<<"$(ctx_window_hot "${five:-}" "${resets:-}" "${seven:--}" "${seven_resets:--}")"
+    [ "${hot:-}" = 7d ] && stop "the week is past its cap"
+    now=$(date +%s)
+    left=$((end - now))
+    if [ "$left" -le 0 ]; then
+      if [ -z "$off" ]; then
+        [ "$(turn_ended_after "$1" "$end")" = "true" ] && stop "a turn of the session ended after the window reset"
+        off=$(size "$1")
+        known=0 ended=0
+        read -r _ _ known ended <<<"$(ctx_last_human "$1" "$STATE/auto/$sid.typed")"
+        [ "$known" = 1 ] || stop "the transcript does not tell whether the user is there"
+        ended=$(int_or "${ended:-}" 0)
+      else
+        [ "$(typed_since "$1" "$off")" = "true" ] && stop "the user typed into the session after the window reset"
+        [ "$(turn_ended_since "$1" "$off")" = "true" ] && stop "a turn of the session ended after the window reset"
+      fi
+      left=5
+      if [ "$ended" -gt 0 ]; then
+        left=$((ended + idle - now))
+        [ "$left" -le 0 ] && return 0
+        [ "$left" -gt 5 ] && left=5
+      fi
+    fi
+    [ $((now - begun)) -lt 86400 ] || stop "still waiting a day later"
+    [ "$left" -gt 30 ] && left=30
+    sleep "$left" &
+    wait $!
+  done
+}
+
+# prompt_into <transcript> <session> -- type the prompt into the idle session
+# that writes <transcript>, and note the row it made, which hooks/handoff
+# passes over when it reads whether the user is there (ctx_last_human's
+# <typed>).
+prompt_into() {
+  local base uuid=""
+  step=prompt
+  base=$(size "$1")
+  settle "$1" "$base"
+  press "$prompt"
+  step=verify
+  for _ in $(seq 1 30); do
+    uuid=$(typed_since --uuid "$1" "$base")
+    [ -n "$uuid" ] && break
+    sleep 1
+  done
+  [ -n "$uuid" ] || stop "typed '$prompt', and no row of it reached the transcript"
+  case "$2" in '' | */* | .*) ;; *) printf '%s\n' "$uuid" >>"$STATE/auto/$2.typed" 2>/dev/null ;; esac
+}
+
+if [ "$at_reset" -eq 1 ]; then
+  step=window
+  begun=$(date +%s)
+  wait_resume "$transcript"
+  waited=$(($(date +%s) - begun))
+  prompt_into "$transcript" "$sid"
+  log auto-resume "$sid" waited "$waited"
+  exit 0
+fi
+
 step=clear
 base=$(size "$transcript")
 settle "$transcript" "$base"
@@ -179,26 +334,17 @@ fsid=$(basename -- "$fresh" .jsonl)
 
 read -r five resets seven seven_resets <<<"$(ctx_window)"
 read -r hot _ <<<"$(ctx_window_hot "${five:-}" "${resets:-}" "${seven:--}" "${seven_resets:--}")"
-if [ -n "${hot:-}" ]; then
+if [ "${hot:-}" = 7d ]; then
   log auto-reset "$sid" to "$fsid" held cap window "$hot" five "$five" seven "$seven"
   exit 0
 fi
+if [ "${hot:-}" = 5h ]; then
+  step=window
+  begun=$(date +%s)
+  wait_cap "$fresh" "$(size "$fresh")"
+  waited=$(($(date +%s) - begun))
+fi
 
-step=prompt
-base=$(size "$fresh")
-settle "$fresh" "$base"
-press "$prompt"
-
-# The row the prompt made is passed over when hooks/handoff reads whether the
-# user is there (ctx_last_human's <typed>).
-step=verify
-uuid=""
-for _ in $(seq 1 30); do
-  uuid=$(typed_since --uuid "$fresh" "$base")
-  [ -n "$uuid" ] && break
-  sleep 1
-done
-[ -n "$uuid" ] || stop "typed '$prompt', and no row of it reached the fresh transcript"
-case "$fsid" in '' | */* | .*) ;; *) printf '%s\n' "$uuid" >>"$STATE/auto/$fsid.typed" 2>/dev/null ;; esac
-log auto-reset "$sid" to "$fsid"
+prompt_into "$fresh" "$fsid"
+log auto-reset "$sid" to "$fsid" waited "$waited"
 exit 0

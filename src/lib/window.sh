@@ -31,7 +31,8 @@
 # highest; a reading of a later window replaces the file, and one of an
 # earlier window is dropped -- the week by its own end, since it can reset
 # within a 5-hour window. A reading at the cap therefore stands until its
-# window ends, however old it is, and a window that has ended reads as none.
+# window ends, however old it is, and a window that has ended reads as
+# unknown: the 5-hour one, and with it a week whose end is unknown (ctx_window).
 
 # ctx_account -- the name of this profile's account: its folder's, without
 # the leading dot, and only characters a file name can hold.
@@ -65,21 +66,29 @@ ctx_window_cap() {
   esac
 }
 
-# ctx_window -- "<five> <resets> <seven> <seven_resets>" while the 5-hour
-# window read last has not ended; nothing otherwise. A week that has ended
-# reads as unknown: "-" for both.
+# ctx_window -- "<five> <resets> <seven> <seven_resets>", a window that has
+# ended, or is unknown, as "-" for both of its fields; nothing when neither is
+# known. The week stands past the end of the 5-hour window it was read with,
+# until its own: on 2026-10-09 a case of the suite caught the wait for a
+# 5-hour reset (task 1 on ctx's board) reading nothing once that window
+# ended, a week past its cap included, and typing 'continuando'. A week
+# whose end is unknown goes with its 5-hour window.
 ctx_window() {
   local five="" resets="" seven="" seven_resets="" file now
   file=$(ctx_window_file)
   [ -r "$file" ] && read -r five resets seven seven_resets _ <"$file" 2>/dev/null
-  case "$five$resets" in '' | *[!0-9]*) return 0 ;; esac
   now=${EPOCHSECONDS:-$(date +%s)}
-  [ "$resets" -gt "$now" ] || return 0
+  case "$five" in '' | *[!0-9]*) five=- ;; esac
+  case "$resets" in '' | *[!0-9]*) resets=- ;; esac
+  if [ "$five" = - ] || [ "$resets" = - ] || [ "$resets" -le "$now" ]; then
+    five=- resets=-
+  fi
   case "$seven" in '' | *[!0-9]*) seven=- ;; esac
   case "$seven_resets" in
   '' | *[!0-9]*) seven_resets=- ;;
   *) [ "$seven_resets" -gt "$now" ] || seven=- seven_resets=- ;;
   esac
+  [ "$five" = - ] && { [ "$seven" = - ] || [ "$seven_resets" = - ]; } && return 0
   echo "$five $resets $seven $seven_resets"
 }
 
@@ -153,14 +162,14 @@ ctx_window_hot() {
 
 # ctx_window_band <five> [<seven>] -- 3 at or past the week's cap, 2 at or
 # past the 5-hour cap, 1 from 70% of it, else 0: the bands the model is told
-# of when the reading crosses them.
+# of when the reading crosses them. <five> "-": its window ended unread.
 ctx_window_band() {
   local hot
   hot=$(ctx_window_hot "$1" - "${2:--}" -)
   case "$hot" in
   7d*) echo 3 ;;
   5h*) echo 2 ;;
-  *) if [ "$1" -ge 70 ]; then echo 1; else echo 0; fi ;;
+  *) if [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge 70 ]; then echo 1; else echo 0; fi ;;
   esac
 }
 
@@ -180,13 +189,19 @@ ctx_window_until() {
 }
 
 # ctx_window_line <five> <resets> [<seven> [<seven_resets>]] -- the reading in
-# one line: "5h 62% until 21:40, cap 85% · 7d 48% until Sat 21:00, cap 95%".
+# one line: "5h 62% until 21:40, cap 85% · 7d 48% until Sat 21:00, cap 95%";
+# <five> "-", "5h reset, not read since".
 ctx_window_line() {
   local cap cap7 line seven=""
   cap=$(ctx_window_cap)
   cap7=$(ctx_window_cap 7d)
-  line="5h $1% until $(ctx_window_until 5h "$2")"
-  [ "$cap" -gt 0 ] && line="$line, cap $cap%"
+  case "$1" in
+  '' | *[!0-9]*) line="5h reset, not read since" ;;
+  *)
+    line="5h $1% until $(ctx_window_until 5h "$2")"
+    [ "$cap" -gt 0 ] && line="$line, cap $cap%"
+    ;;
+  esac
   case "${3:--}" in
   '' | *[!0-9]*) ;;
   *)

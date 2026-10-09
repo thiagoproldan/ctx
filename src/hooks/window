@@ -21,7 +21,8 @@
 #           prompts.
 #
 # The reading is the one bin/statusline leaves for the account (lib/window.sh);
-# without one -- no status line yet, or its window ended -- nothing is said.
+# without one -- no status line yet, or its 5-hour window ended, the week under
+# its cap -- nothing is said.
 # Each session's band last told is kept in $CTX_STATE/window/told/<session>.
 set -u
 
@@ -50,6 +51,7 @@ case "$sid" in '' | */* | .*) exit 0 ;; esac
 read -r five resets seven seven_resets <<<"$(ctx_window)"
 [ -n "${five:-}" ] || exit 0
 band=$(ctx_window_band "$five" "$seven")
+[ "$five" = - ] && [ "$band" -lt 3 ] && exit 0
 told="$STATE/window/told/$sid"
 was=""
 [ -r "$told" ] && read -r was <"$told"

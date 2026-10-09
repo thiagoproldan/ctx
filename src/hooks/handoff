@@ -43,9 +43,19 @@
 # this session's Claude Code, and not while anything but a background shell
 # is pending: a scheduled wakeup, a monitor or a subagent was not tested
 # across a /clear. So a cap by itself never asks, and never resets: a reset
-# costs the window, it does not spare it. Past a cap (ekko task 808)
-# bin/auto-reset types the /clear and not 'continuando': the fresh session
-# waits for the user, whose reserve the rest of the window is.
+# costs the window, it does not spare it. Past the 5-hour cap (ekko task 808)
+# bin/auto-reset types the /clear, and 'continuando' only once the window has
+# reset; past the week's, not at all: the fresh session waits for the user.
+#
+# A session paused for the 5-hour window resumes when it resets (task 1 on
+# ctx's board). On 2026-10-02 a session at 90%, told to start nothing long,
+# stopped short of its task with a handoff written, and the work waited for
+# the user to come back long after the window renewed. So a stop past the
+# 5-hour cap, or from 70% of it with a fresh handoff, in the session's own
+# tab, asked nothing, starts bin/auto-reset --at-reset: once the window ends,
+# if no turn of this session ended after that and the user has been away
+# CTX_AUTO_RESET_IDLE minutes, it types 'continuando' into it. Short of the
+# cap, without a handoff, a stop may as well be the work's end.
 #
 # Alone, a handoff this session wrote that is still fresh -- less than a tenth
 # of the threshold of context since (hooks/handoff-written notes each one) --
@@ -113,10 +123,34 @@ claude_pid() {
   return 1
 }
 
+five="" resets="" seven="" seven_resets=""
+read -r five resets seven seven_resets <<<"$(ctx_window)"
+five=$(int_or "${five:-}" "")
+# The window past its cap, if any: "<5h|7d> <percent> <resets> <cap>".
+read -r hot_window hot_pct hot_at hot_cap <<<"$(ctx_window_hot "$five" "$resets" "$seven" "$seven_resets")"
+
+# A handoff this session wrote that is still fresh: less than a tenth of the
+# threshold of context since (hooks/handoff-written notes each one).
+written=$(ctx_handoff_written "$STATE" "$sid")
+fresh=0
+[ -n "$written" ] && [ "$tokens" -ge "$written" ] &&
+  [ $((tokens - written)) -lt $((threshold / 10)) ] && fresh=1
+# A stop the window's reset resumes (see the top): past the 5-hour cap, or
+# from 70% of it with a fresh handoff, the week under its cap.
+resumable=0
+case "$(ctx_window_band "$five" "$seven")" in
+2) resumable=1 ;;
+1) resumable=$fresh ;;
+esac
+
 # Whether the session runs alone: the user away, in a Konsole tab ctx can type
 # into, with this session's Claude Code in its foreground, nothing but
-# background shells pending. Read only past the threshold, where it can change
-# what happens; the tab, a D-Bus call, only once all else reads alone.
+# background shells pending. Read only past the threshold or at a stop the
+# reset resumes, where it can change what happens; the tab, a D-Bus call, only
+# once all else reads alone -- or, at a stop the reset resumes, whether or not
+# the user is away: the wait for the reset reads that once it is over, since
+# the turn that stops for the window is often the first after the user's
+# prompt, which no time away is counted in (ekko task 967).
 #
 # A background session, which Claude Code's supervisor runs in a pty of its
 # own, keeps the Konsole address of the shell it was dispatched from, and that
@@ -125,18 +159,26 @@ claude_pid() {
 # at its first check, the same foreground: 4 of the 13 resets started over
 # 2026-09-27..30. Away there, the ask it is spared is logged with tab other.
 idle_min=$(int_or "${CTX_AUTO_RESET_IDLE:-}" 10)
-alone=0 away=0 cpid="" elsewhere=0
-if [ "$idle_min" -gt 0 ] && [ "$threshold" -gt 0 ] && [ "$tokens" -ge "$threshold" ] &&
+alone=0 away=0 cpid="" elsewhere=0 own=0
+past=0
+[ "$threshold" -gt 0 ] && [ "$tokens" -ge "$threshold" ] && past=1
+if [ "$idle_min" -gt 0 ] && { [ "$past" -eq 1 ] || [ "$resumable" -eq 1 ]; } &&
   [ "$unshelled" -eq 0 ] && [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "cli" ] &&
   [ -n "${KONSOLE_DBUS_SERVICE:-}" ] && [ -n "${KONSOLE_DBUS_SESSION:-}" ] &&
   cpid=$(claude_pid); then
-  known=0 ended=0
+  known=0 ended=0 gone=0
   read -r _ _ known ended <<<"$(ctx_last_human "$transcript" "$STATE/auto/$sid.typed")"
   ended=$(int_or "${ended:-}" 0)
   if [ "$known" = "1" ] && [ "$ended" -gt 0 ]; then
     away=$((($(date +%s) - ended) / 60))
-    if [ "$away" -ge "$idle_min" ]; then
-      if [ "$(ctx_konsole_foreground)" = "$cpid" ]; then alone=1; else elsewhere=1; fi
+    [ "$away" -ge "$idle_min" ] && gone=1
+  fi
+  if [ "$known" = "1" ] && { [ "$gone" -eq 1 ] || [ "$resumable" -eq 1 ]; }; then
+    if [ "$(ctx_konsole_foreground)" = "$cpid" ]; then
+      own=1
+      [ "$gone" -eq 1 ] && [ "$past" -eq 1 ] && alone=1
+    elif [ "$gone" -eq 1 ] && [ "$past" -eq 1 ]; then
+      elsewhere=1
     fi
   fi
 fi
@@ -147,10 +189,8 @@ fi
 # Alone, with a fresh handoff written: the reset, typed by bin/auto-reset once
 # this turn has ended. Detached, with no descriptor of this hook's: Claude
 # Code waits for the hook's output to close.
-written=$(ctx_handoff_written "$STATE" "$sid")
-if [ "$alone" -eq 1 ] && [ -n "$written" ] && [ "$tokens" -ge "$written" ] &&
-  [ $((tokens - written)) -lt $((threshold / 10)) ]; then
-  if [ ! -d "$STATE/auto/$sid.lock" ]; then
+if [ "$alone" -eq 1 ] && [ "$fresh" -eq 1 ]; then
+  if ! ctx_auto_busy "$STATE" "$sid"; then
     CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log auto-reset-start "$sid" \
       tokens "$tokens" written "$written" away "$away" pending "$pending"
     setsid -f "$ROOT/bin/auto-reset" "$sid" "$transcript" "$cpid" \
@@ -160,12 +200,6 @@ if [ "$alone" -eq 1 ] && [ -n "$written" ] && [ "$tokens" -ge "$written" ] &&
 fi
 
 [ "$active" = "true" ] && exit 0
-
-five="" resets="" seven="" seven_resets=""
-read -r five resets seven seven_resets <<<"$(ctx_window)"
-five=$(int_or "${five:-}" "")
-# The window past its cap, if any: "<5h|7d> <percent> <resets> <cap>".
-read -r hot_window hot_pct hot_at hot_cap <<<"$(ctx_window_hot "$five" "$resets" "$seven" "$seven_resets")"
 
 band=0
 [ "$threshold" -gt 0 ] && band=$((tokens / threshold))
@@ -220,6 +254,14 @@ if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_cap" -eq 0 ]; }; t
   else
     rm -f -- "$quiet" 2>/dev/null
   fi
+  # A stop the reset resumes, in this session's own tab, asked nothing: the
+  # wait for the reset (see the top). One at a time: the lock is its.
+  if [ "$own" -eq 1 ] && [ "$resumable" -eq 1 ] && ! ctx_auto_busy "$STATE" "$sid"; then
+    CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log auto-resume-start "$sid" \
+      tokens "$tokens" five "$five" away "$away"
+    setsid -f "$ROOT/bin/auto-reset" --at-reset "$sid" "$transcript" "$cpid" \
+      </dev/null >/dev/null 2>&1
+  fi
   exit 0
 fi
 
@@ -246,9 +288,12 @@ CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff "$sid" \
 # Alone, the reset follows the handoff by itself: the /clear above is ctx's to
 # type, and the fresh session is all that will know of a task still running.
 auto=""
-if [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ] && [ "$hot" -eq 1 ]; then
+if [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ] && [ "${hot_window:-}" = 5h ]; then
   auto="
-The user has been away for ${away} minutes: once the handoff is written and this turn ends, ctx types /clear into this session's tab, and not '${CTX_AUTO_RESET_PROMPT:-continuando}': past the cap the fresh session waits for the user."
+The user has been away for ${away} minutes: once the handoff is written and this turn ends, ctx types /clear into this session's tab, and '${CTX_AUTO_RESET_PROMPT:-continuando}' once the 5-hour window resets at $(ctx_window_until 5h "$hot_at"): past the cap the fresh session waits for the reset."
+elif [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ] && [ "$hot" -eq 1 ]; then
+  auto="
+The user has been away for ${away} minutes: once the handoff is written and this turn ends, ctx types /clear into this session's tab, and not '${CTX_AUTO_RESET_PROMPT:-continuando}': past the week's cap the fresh session waits for the user."
 elif [ "$alone" -eq 1 ] && [ "$ask_tokens" -eq 1 ]; then
   auto="
 The user has been away for ${away} minutes: once the handoff is written and this turn ends, ctx types /clear and '${CTX_AUTO_RESET_PROMPT:-continuando}' into this session's tab, and a fresh session goes on from the handoff."

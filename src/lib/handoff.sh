@@ -121,3 +121,18 @@ ctx_handoff_written() {
   [ -r "$1/handoff/$2.written" ] && read -r at <"$1/handoff/$2.written"
   case "$at" in '' | *[!0-9]*) ;; *) echo "$at" ;; esac
 }
+
+# ctx_auto_busy <state> <session> -- a bin/auto-reset of the session's is
+# running: its lock is there, with the pid it wrote alive, or too new to hold
+# one yet. Its wait for a window's reset lasts hours, so the machine may go
+# down under it, and a lock left behind would hold back every reset of the
+# session after: a lock whose process is gone is no one's.
+ctx_auto_busy() {
+  local lock="$1/auto/$2.lock" pid=""
+  [ -d "$lock" ] || return 1
+  [ -r "$lock/pid" ] && read -r pid <"$lock/pid"
+  case "$pid" in
+  '' | *[!0-9]*) [ -z "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] ;;
+  *) kill -0 "$pid" 2>/dev/null ;;
+  esac
+}

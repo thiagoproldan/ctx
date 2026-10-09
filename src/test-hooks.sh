@@ -466,6 +466,10 @@ w ctx_window_merge 20 $((at2 + 120)) -
 eq "the same window, its end rounded: the highest" "20 $((at2 + 120)) 41 -" "$(w ctx_window)"
 echo "95 $((now - 60)) 50" >"$CTX_STATE/window/profile-w"
 eq "a window that ended reads as none" "" "$(w ctx_window)"
+echo "95 $((now - 60)) 97 $wk1" >"$CTX_STATE/window/profile-w"
+eq "...but for its week, which stands until its own end" "- - 97 $wk1" "$(w ctx_window)"
+echo "95 $((now - 60)) 97 $((now - 30))" >"$CTX_STATE/window/profile-w"
+eq "...and both ended: none" "" "$(w ctx_window)"
 # The week can reset within a 5-hour window: it goes by its own end.
 wk2=$((wk1 + 604800))
 v() { CLAUDE_CONFIG_DIR="$TMP/profile-wk" "$@"; }
@@ -490,6 +494,8 @@ eq "one line for the model" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 
   "$(ctx_window_line 62 "$at1" 41 "$wk1")"
 eq "...the week's end unknown" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 41%, cap 95%" "$(ctx_window_line 62 "$at1" 41 -)"
 eq "...no week" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85%" "$(ctx_window_line 62 "$at1" -)"
+eq "...the 5-hour window ended unread" "5h reset, not read since · 7d 97% until $(LC_ALL=C date -d "@$wk1" '+%a %H:%M'), cap 95%" \
+  "$(ctx_window_line - - 97 "$wk1")"
 
 # --- window (SessionStart, UserPromptSubmit, PostToolUse) ------------------------------
 # The model is told the reading as a session starts and with every prompt, and
@@ -1164,20 +1170,74 @@ WAIT=3 reset_env "$AR" s-a8 "$TMP/ar-a8/s-a8.jsonl" $$
 eq "the box changes at every reading: nothing typed" "'' " "$(sent)"
 has "...logged" present "changed between readings" "$(said s-a8)"
 
-# Past the cap on the 5-hour window, the /clear and not the prompt: the fresh
-# session waits for the user (ekko task 808).
+# Past the cap on the 5-hour window, the /clear, and the prompt only once the
+# window has reset (ekko task 808; task 1 on ctx's board): the fresh session
+# waits for it. Here the window ends 8 seconds on.
 CLAUDE_CONFIG_DIR="$TMP/profile-c" ctx_window_merge 90 "$at1" 40
+CLAUDE_CONFIG_DIR="$TMP/profile-c5" ctx_window_merge 90 $(($(date +%s) + 8)) 40
 tab a9
 rows "$TMP/ar-a9/s-a9.jsonl" 300000 human:40
-reset_env CLAUDE_CONFIG_DIR="$TMP/profile-c" "$AR" s-a9 "$TMP/ar-a9/s-a9.jsonl" $$
-eq "past the cap: /clear, and not the prompt" "'' /clear \$'\\r' " "$(sent)"
-has "...logged as held" present '"held":"cap"' "$(said s-a9)"
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-c5" "$AR" s-a9 "$TMP/ar-a9/s-a9.jsonl" $$
+eq "past the cap: /clear, then the prompt once the window resets" "'' /clear \$'\\r' continuando \$'\\r' " "$(sent)"
+waited=$(said s-a9 | jq -r '.waited // 0')
+eq "...after waiting for it" yes "$([ "$waited" -ge 1 ] && echo yes || echo "no ($waited s)")"
 CLAUDE_CONFIG_DIR="$TMP/profile-c7" ctx_window_merge 10 "$at1" 96 "$wk1"
 tab a11
 rows "$TMP/ar-a11/s-a11.jsonl" 300000 human:40
 reset_env CLAUDE_CONFIG_DIR="$TMP/profile-c7" "$AR" s-a11 "$TMP/ar-a11/s-a11.jsonl" $$
 eq "past the week's cap: /clear, and not the prompt" "'' /clear \$'\\r' " "$(sent)"
 has "...logged as held, naming the week" present '"held":"cap","window":"7d"' "$(said s-a11)"
+
+# --at-reset: no /clear, and the prompt into the same session once the window
+# resets, if no turn of it ended after the reset and the user has been away
+# CTX_AUTO_RESET_IDLE minutes by then.
+CLAUDE_CONFIG_DIR="$TMP/profile-r1" ctx_window_merge 96 $(($(date +%s) + 5)) 40
+tab r1
+rows "$TMP/ar-r1/s-r1.jsonl" 50000 human:40 end:39
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-r1" "$AR" --at-reset s-r1 "$TMP/ar-r1/s-r1.jsonl" $$
+eq "at the reset: the prompt, and no /clear" "'' continuando \$'\\r' " "$(sent)"
+has "...logged as a resume" present '"ev":"auto-resume","sid":"s-r1","waited":"' "$(said s-r1)"
+has "...noting the prompt's row as ctx's own" present "typed-row" "$(cat "$CTX_STATE/auto/s-r1.typed" 2>/dev/null)"
+has "...and leaving no lock" absent "s-r1.lock" "$(ls "$CTX_STATE/auto")"
+# The user came back before the reset: their turn runs across it, and ends
+# after.
+CLAUDE_CONFIG_DIR="$TMP/profile-r2" ctx_window_merge 96 $(($(date +%s) + 3)) 40
+tab r2
+rows "$TMP/ar-r2/s-r2.jsonl" 50000 human:40 end:39
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-r2" "$AR" --at-reset s-r2 "$TMP/ar-r2/s-r2.jsonl" $$ &
+sleep 1
+jq -nc '{type: "user", uuid: "back", origin: {kind: "human"}, timestamp: (now | todate), message: {content: "voltei"}}' >>"$TMP/ar-r2/s-r2.jsonl"
+sleep 8
+jq -nc '{type: "system", subtype: "turn_duration", durationMs: 1000, timestamp: (now | todate)}' >>"$TMP/ar-r2/s-r2.jsonl"
+wait $!
+eq "the user's turn ran across the reset: nothing typed" "'' " "$(sent)"
+has "...logged" present "a turn of the session ended after the window reset" "$(said s-r2)"
+r3_at=$(($(date +%s) + 6))
+CLAUDE_CONFIG_DIR="$TMP/profile-r3" ctx_window_merge 96 "$r3_at" 40
+tab r3
+rows "$TMP/ar-r3/s-r3.jsonl" 50000 human:40 end:39
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-r3" "$AR" --at-reset s-r3 "$TMP/ar-r3/s-r3.jsonl" $$ &
+sleep 2
+CLAUDE_CONFIG_DIR="$TMP/profile-r3" ctx_window_merge 96 "$r3_at" 97 "$wk1"
+wait $!
+eq "the week past its cap during the wait: nothing typed" "'' " "$(sent)"
+has "...logged" present "the week is past its cap" "$(said s-r3)"
+# The stop was the first turn after the user's prompt, 51 seconds before the
+# wait began: away a minute (CTX_AUTO_RESET_IDLE=1) only after the reset.
+CLAUDE_CONFIG_DIR="$TMP/profile-r8" ctx_window_merge 96 $(($(date +%s) + 2)) 40
+tab r4
+rows "$TMP/ar-r4/s-r4.jsonl" 50000 human:1 end:0.85
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-r8" CTX_AUTO_RESET_IDLE=1 "$AR" --at-reset s-r4 "$TMP/ar-r4/s-r4.jsonl" $$
+eq "away less than CTX_AUTO_RESET_IDLE at the reset: the prompt" "'' continuando \$'\\r' " "$(sent)"
+gap=$(jq -rs 'def t: .timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601;
+  ([.[] | select(.uuid == "typed-row") | t][0]) - ([.[] | select(.subtype == "turn_duration") | t][0])' "$TMP/ar-r4/s-r4.jsonl")
+eq "...once the user had been away a minute" yes "$([ "${gap:-0}" -ge 59 ] && echo yes || echo "no (${gap:-?} s)")"
+CLAUDE_CONFIG_DIR="$TMP/profile-r9" ctx_window_merge 50 $(($(date +%s) - 60)) 40
+tab r5
+transcript "$TMP/ar-r5/s-r5.jsonl" 50000
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-r9" "$AR" --at-reset s-r5 "$TMP/ar-r5/s-r5.jsonl" $$
+eq "no origin in the transcript: nothing typed" "'' " "$(sent)"
+has "...logged" present "does not tell whether the user is there" "$(said s-r5)"
 
 tab a5 busy
 rows "$TMP/ar-a5/s-a5.jsonl" 300000 human:40
@@ -1207,8 +1267,8 @@ stop_auto() {
 fresh_handoff() { mkdir -p "$CTX_STATE/handoff" && echo "$2" >"$CTX_STATE/handoff/$1.written"; }
 # settled <session> -- the detached reset's last word, waited for
 settled() {
-  for _ in $(seq 1 40); do
-    said "$1" | grep -q -E '"ev":"auto-reset(-stop)?"' && break
+  for _ in $(seq 1 60); do
+    said "$1" | grep -q -E '"ev":"auto-re(set|sume)(-stop)?"' && break
     sleep 0.25
   done
   said "$1"
@@ -1263,8 +1323,126 @@ transcript "$TMP/ar-h3/old.jsonl" 262000
 out=$(stop_auto s-h8 "$(stop_json s-h8 "$TMP/ar-h3/old.jsonl")")
 is "no origin in the transcript: never alone, nothing asked" quiet "$out"
 out=$(stop_auto s-h9 "$(stop_json s-h9 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-c")
-has "alone past the cap: the /clear, not 'continuando'" present "ctx types /clear into this session's tab, and not 'continuando'" "$out"
+has "alone past the cap: the /clear, and 'continuando' at the reset" present \
+  "ctx types /clear into this session's tab, and 'continuando' once the 5-hour window resets at $(date -d "@$at1" +%H:%M)" "$out"
 has "...and what the cap asks" present "Past the cap the rest of the window is the user's reserve" "$out"
+out=$(stop_auto s-h9w "$(stop_json s-h9w "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-c7")
+has "alone past the week's cap: the /clear, not 'continuando'" present "and not 'continuando': past the week's cap" "$out"
+
+# A stop for the 5-hour window, in the session's own tab, asked nothing:
+# bin/auto-reset --at-reset waits for the reset (its own cases above).
+CLAUDE_CONFIG_DIR="$TMP/profile-r4" ctx_window_merge 96 $(($(date +%s) + 4)) 40
+tab h13
+rows "$TMP/ar-h13/s-h13.jsonl" 50000 human:40 end:39
+out=$(stop_auto s-h13 "$(stop_json s-h13 "$TMP/ar-h13/s-h13.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r4")
+is "alone, 50k, past the 5-hour cap: nothing asked" quiet "$out"
+has "...the wait for the reset starts" present '"ev":"auto-resume-start","sid":"s-h13"' "$(cat "$CTX_STATE/handoff.jsonl")"
+last=$(settled s-h13)
+has "...and at the reset, the prompt" present '"ev":"auto-resume","sid":"s-h13"' "$last"
+eq "...into the same session, no /clear" "'' continuando \$'\\r' " "$(sent)"
+# unwait <session> -- end the session's wait as a signal would: "gone" once
+# its lock is.
+unwait() {
+  local p=""
+  for _ in $(seq 1 30); do
+    p=$(cat "$CTX_STATE/auto/$1.lock/pid" 2>/dev/null)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && break
+    sleep 0.1
+  done
+  kill "$p" 2>/dev/null
+  for _ in $(seq 1 30); do
+    [ -d "$CTX_STATE/auto/$1.lock" ] || {
+      echo gone
+      return
+    }
+    sleep 0.1
+  done
+  echo held
+}
+CLAUDE_CONFIG_DIR="$TMP/profile-r5" ctx_window_merge 96 "$at1" 40
+CLAUDE_CONFIG_DIR="$TMP/profile-r6" ctx_window_merge 50 "$at1" 97 "$wk1"
+CLAUDE_CONFIG_DIR="$TMP/profile-r7" ctx_window_merge 50 "$at1" 40
+CLAUDE_CONFIG_DIR="$TMP/profile-r10" ctx_window_merge 80 "$at1" 40
+# The stop the first turn after the user's prompt, with them there: the wait
+# starts all the same, and reads at the reset whether they are away.
+tab h14
+rows "$TMP/ar-h14/s-h14.jsonl" 50000 human:2 end:1
+stop_auto s-h14 "$(stop_json s-h14 "$TMP/ar-h14/s-h14.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r5" >/dev/null
+has "the user there, past the cap: the wait starts too" present '"ev":"auto-resume-start","sid":"s-h14"' "$(cat "$CTX_STATE/handoff.jsonl")"
+eq "...and a signal ends it, the lock with it" gone "$(unwait s-h14)"
+rows "$TMP/ar-h14/s-h15.jsonl" 50000 human:40 end:39
+stop_auto s-h15 "$(stop_json s-h15 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r6" >/dev/null
+stop_auto s-h16 "$(stop_json s-h16 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r7" >/dev/null
+stop_auto s-h17 "$(stop_json s-h17 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r5" CTX_AUTO_RESET_IDLE=0 >/dev/null
+stop_auto s-h19 "$(stop_json s-h19 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r10" >/dev/null
+fresh_handoff s-h20 49000
+stop_auto s-h20 "$(stop_json s-h20 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r10" >/dev/null
+started=$(grep auto-resume-start "$CTX_STATE/handoff.jsonl")
+has "alone past the week's cap: no wait" absent '"sid":"s-h15"' "$started"
+has "alone under 70%: no wait" absent '"sid":"s-h16"' "$started"
+has "CTX_AUTO_RESET_IDLE=0: no wait" absent '"sid":"s-h17"' "$started"
+has "alone at 80%, no handoff: no wait" absent '"sid":"s-h19"' "$started"
+has "alone at 80%, a handoff just written: the wait starts" present '"sid":"s-h20"' "$started"
+unwait s-h20 >/dev/null
+# One wait at a time, and a lock its process left behind is no one's.
+mkdir -p "$CTX_STATE/auto/s-h18.lock"
+stop_auto s-h18 "$(stop_json s-h18 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r5" >/dev/null
+sleep 30 &
+mkdir -p "$CTX_STATE/auto/s-h22.lock" && echo $! >"$CTX_STATE/auto/s-h22.lock/pid"
+stop_auto s-h22 "$(stop_json s-h22 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r5" >/dev/null
+kill $! 2>/dev/null
+sleep 0 &
+dead=$!
+wait $dead
+mkdir -p "$CTX_STATE/auto/s-h21.lock" && echo "$dead" >"$CTX_STATE/auto/s-h21.lock/pid"
+stop_auto s-h21 "$(stop_json s-h21 "$TMP/ar-h14/s-h15.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-r5" >/dev/null
+started=$(grep auto-resume-start "$CTX_STATE/handoff.jsonl")
+has "a lock just taken: no second wait" absent '"sid":"s-h18"' "$started"
+has "a lock held by a live process: no second wait" absent '"sid":"s-h22"' "$started"
+has "a lock whose process is gone: the wait starts" present '"sid":"s-h21"' "$started"
+eq "...and takes the lock over" gone "$(unwait s-h21)"
+rm -rf "$CTX_STATE/auto/s-h18.lock" "$CTX_STATE/auto/s-h22.lock"
+
+# The week outlives the 5-hour reading it came with: once that window has
+# ended, every reader of the account's reading acts on a week past its cap,
+# and on nothing else. Before that rule the wait for the reset read none,
+# the week past its cap included, and typed the prompt (r3 above).
+# Installed, each is the .<name>-wrapped its wrapper runs.
+# shellcheck disable=SC2016 # the call itself, as the readers write it
+eq "the readers of the account's reading" "bin/auto-reset hooks/guard-window hooks/handoff hooks/window" \
+  "$(cd "$ROOT" && grep -l -r -F '$(ctx_window)' hooks bin | sed -E 's|/\.(.+)-wrapped$|/\1|' | sort | xargs)"
+gone=$(($(date +%s) - 60))
+CLAUDE_CONFIG_DIR="$TMP/profile-e97" ctx_window_merge 50 "$gone" 97 "$wk1"
+CLAUDE_CONFIG_DIR="$TMP/profile-e50" ctx_window_merge 50 "$gone" 50 "$wk1"
+eq "a reading whose 5-hour window ended" "- - 97 $wk1" "$(CLAUDE_CONFIG_DIR="$TMP/profile-e97" ctx_window)"
+CLAUDE_CONFIG_DIR="$TMP/profile-e97" check "guard-window, the week past its cap: refused" deny guard-window "$(tool_json Agent)"
+CLAUDE_CONFIG_DIR="$TMP/profile-e50" check "...under it: goes" allow guard-window "$(tool_json Agent)"
+wake='{"session_id":"e1","prompt":"check","source":"loop_wakeup"}'
+out=$(printf '%s' "$wake" | wh prompt CLAUDE_CONFIG_DIR="$TMP/profile-e97")
+eq "window, the week past its cap: a wakeup held" block "$(held "$out")"
+has "...naming the week" present "the 7-day window is at 97%" "$(told "$out")"
+eq "...under it: nothing said" "" "$(printf '%s' "$wake" | wh prompt CLAUDE_CONFIG_DIR="$TMP/profile-e50")"
+out=$(stop_auto s-e1 "$(stop_json s-e1 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-e97")
+has "handoff, alone, the week past its cap: not 'continuando'" present "and not 'continuando': past the week's cap" "$out"
+out=$(stop_auto s-e2 "$(stop_json s-e2 "$TMP/ar-h3/s-h3.jsonl")" CLAUDE_CONFIG_DIR="$TMP/profile-e50")
+has "...under it: /clear and 'continuando'" present "ctx types /clear and 'continuando' into this session's tab" "$out"
+tab e3
+rows "$TMP/ar-e3/s-e3.jsonl" 300000 human:40
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-e97" "$AR" s-e3 "$TMP/ar-e3/s-e3.jsonl" $$
+eq "auto-reset, the week past its cap: /clear, not the prompt" "'' /clear \$'\\r' " "$(sent)"
+tab e4
+rows "$TMP/ar-e4/s-e4.jsonl" 300000 human:40
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-e50" "$AR" s-e4 "$TMP/ar-e4/s-e4.jsonl" $$
+eq "...under it: /clear and the prompt" "'' /clear \$'\\r' continuando \$'\\r' " "$(sent)"
+tab e5
+rows "$TMP/ar-e5/s-e5.jsonl" 50000 human:40 end:39
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-e97" "$AR" --at-reset s-e5 "$TMP/ar-e5/s-e5.jsonl" $$
+eq "auto-reset --at-reset, the week past its cap: nothing typed" "'' " "$(sent)"
+has "...logged" present "the week is past its cap" "$(said s-e5)"
+tab e6
+rows "$TMP/ar-e6/s-e6.jsonl" 50000 human:40 end:39
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-e50" "$AR" --at-reset s-e6 "$TMP/ar-e6/s-e6.jsonl" $$
+eq "...under it: the prompt" "'' continuando \$'\\r' " "$(sent)"
 
 # ekko task 975: h3's input, then h1's, with another process in the tab's
 # foreground. No ask, and no reset to stop at its first check.

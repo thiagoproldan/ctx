@@ -277,9 +277,36 @@ Enter typed into one would approve the call. What was measured on 2026-09-26
 A prompt typed this way is recorded as the user's own, so the rows ctx
 typed are listed in `$CTX_STATE/auto/<session>.typed` and passed over when
 presence is read. A cap never resets by itself: a reset spends the window,
-it does not spare it. And past a cap, the reset types the `/clear` and not
-`continuando`: the fresh session costs nothing while it waits for the user,
-whose reserve the rest of the window is.
+it does not spare it.
+
+**A pause for the 5-hour window ends at its reset.** On 2026-10-02 a session
+at 90%, told to start nothing long, stopped short of its task with a handoff
+written, and the work waited for the user to come back and type, long after
+the window had renewed (task 1 on ctx's board). Claude Code's own
+auto-continue resumes only at 100% of a limit, not at ctx's cap. So:
+
+- Past the 5-hour cap, the reset types the `/clear`, and `continuando` only
+  once the window has reset, unless the user has typed into the fresh session
+  by then: it costs nothing while it waits, and the rest of the window is the
+  user's.
+- A stop past the 5-hour cap, or from 70% of it with a handoff just written,
+  in the session's own tab, that the Stop hook asks nothing at, logs
+  `auto-resume-start` and starts `bin/auto-reset --at-reset`, whether or not
+  the user is away: the turn that stops for the window is often the first
+  after the user's prompt, which no time away is counted in. Once the window
+  ends, it types `continuando` into that same session, logged as
+  `auto-resume`, if no turn of the session ended after the reset — the
+  user's, or the session's own — and the user has been away
+  `CTX_AUTO_RESET_IDLE` minutes, counted as above; at the reset come the same
+  checks as before every keystroke. Short of the cap, without a handoff, a
+  stop may as well be the work's end, and nothing waits.
+- Past the week's cap nothing waits, and the reset types the `/clear` and not
+  `continuando`: the week resets days later.
+
+A wait reads the window every half minute at most, and ends, as
+`auto-reset-stop`, when the tab's foreground changes, the week passes its cap
+or a day goes by. Its lock holds the pid that took it, so that one the
+machine went down under does not hold back the session's resets after.
 
 ## The usage caps
 
@@ -313,7 +340,13 @@ falls within a window, so the readings of one window keep the highest, a
 later window replaces them, and one of an earlier window is dropped — the
 week by its own end, since it can reset within a 5-hour window. A reading at
 a cap stands until its window ends, however old it is, and a window that has
-ended reads as none.
+ended reads as unknown. The week stands past the end of the 5-hour window it
+was read with, until its own: on 2026-10-09 a case of the suite caught the
+wait for a 5-hour reset reading nothing once that window ended, a week past
+its cap included, and typing `continuando`. So every reader of the reading —
+`guard-window`, `window`, the Stop hook and `bin/auto-reset` — acts on a
+week past its cap while no session has read the new 5-hour window, and the
+model is told `5h reset, not read since · 7d 97% …`.
 
 **What the model is told.** One line as a session starts and with every
 prompt — `ctx: 5h 62% until 21:40, cap 85% · 7d 48% until Sun 11:11, cap
@@ -333,7 +366,8 @@ work; start nothing long) or its cap, or the week its cap, even past the
   `schedule_wakeup`). A recurring schedule fires again after the window
   resets. A prompt without a `source` counts as the user's, since Claude Code
   says payloads may omit it while the field rolls out.
-- `bin/auto-reset` types the `/clear` and not `continuando`.
+- `bin/auto-reset` types the `/clear`, and `continuando` only once the 5-hour
+  window has reset; past the week's cap, not at all (_A session left alone_).
 
 The user's own prompt goes through, with the reading and what the cap asks:
 the reserve is theirs to spend.
@@ -614,9 +648,9 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
 | `CTX_COLD_TOKENS`       | `0`                       | Cold-return hook: context worth stopping a prompt for (0 off)      |
 | `CTX_COLD_MINUTES`      | `60`                      | Cold-return hook: idle minutes that make the cache cold (0 off)    |
-| `CTX_AUTO_RESET_IDLE`   | `10`                      | Stop hook: idle minutes that make the user away (0 off)            |
-| `CTX_AUTO_RESET_PROMPT` | `continuando`             | Auto reset: what it types into the fresh session                   |
-| `CTX_AUTO_RESET_WAIT`   | `300`                     | Auto reset: seconds each wait lasts before it gives up             |
+| `CTX_AUTO_RESET_IDLE`   | `10`                      | Stop hook and resume: idle minutes that make the user away (0 off) |
+| `CTX_AUTO_RESET_PROMPT` | `continuando`             | Auto reset: what it types into the fresh or resumed session        |
+| `CTX_AUTO_RESET_WAIT`   | `300`                     | Auto reset: seconds each wait for the tab lasts before it gives up |
 | `CTX_GUARD_SCRATCH`     | `/tmp:/var/tmp:…`         | Work-loss guard: colon-separated roots it never guards             |
 | `CTX_SECRET_ROOTS`      | `/persist/secrets:…`      | Secrets guard: colon-separated roots whose every file is secret    |
 
