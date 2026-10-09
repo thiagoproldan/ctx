@@ -1457,6 +1457,102 @@ out=$(FG=1 stop_auto s-h12 "$(stop_json s-h12 "$TMP/ar-h12/s-h12.jsonl" true 1)"
 is "h1's, another process in the foreground: quiet" quiet "$out"
 has "...and no reset" absent '"sid":"s-h12"' "$(grep auto-reset "$CTX_STATE/handoff.jsonl")"
 
+# --- cleared (SessionEnd, SessionStart) --------------------------------------------
+# The fresh session a /clear starts is told what the ended one did after its
+# last handoff: the files it changed and its last commands (task 6 on ctx's
+# board).
+echo "cleared (SessionEnd, SessionStart):"
+CL="$TMP/cleared"
+mkdir -p "$CL"
+# use <id> <tool> <input> [sidechain] -- an assistant row calling a tool
+use() {
+  jq -nc --arg id "$1" --arg n "$2" --argjson i "$3" --argjson s "${4:-false}" \
+    '{type: "assistant", isSidechain: $s, cwd: "/w", message: {content: [{type: "tool_use", id: $id, name: $n, input: $i}]}}'
+}
+# result <id> <text> -- the user row a tool's result comes back in
+result() {
+  jq -nc --arg id "$1" --arg t "$2" \
+    '{type: "user", isSidechain: false, cwd: "/w", message: {content: [{type: "tool_result", tool_use_id: $id, content: [{type: "text", text: $t}]}]}}'
+}
+EK=mcp__plugin_ekko_ekko__create
+{
+  use a1 Edit '{"file_path": "/w/src/a.rs"}'
+  use h1 "$EK" '{"kind": "handoff", "text": "x", "attached_to": 7}'
+  result h1 '{"ok":true,"items":[{"id":1170,"uid":"u"}]}'
+} >"$CL/nothing.jsonl"
+{
+  cat "$CL/nothing.jsonl"
+  use b1 Edit '{"file_path": "/w/src/b.rs"}'
+  use c1 Write '{"file_path": "/w/docs/c.md"}'
+  use d1 Edit '{"file_path": "/w/src/d.rs"}' true
+  use e1 Bash '{"command": "cargo test"}'
+  use b2 Edit '{"file_path": "/w/src/b.rs"}'
+  use f1 Bash '{"command": "git commit -m \"x\"\nmore"}'
+} >"$CL/after.jsonl"
+eq "after the handoff: the files changed, the last commands" \
+  "ctx: the session this /clear ended went on after its handoff (ekko 1170). It changed 2 file(s): docs/c.md, src/b.rs. Its last commands: \`cargo test\`; \`git commit -m \"x\"\`. The handoff does not cover these: check them against it before acting on it." \
+  "$(ctx_after_handoff "$CL/after.jsonl")"
+eq "nothing after the handoff: nothing" "" "$(ctx_after_handoff "$CL/nothing.jsonl")"
+{
+  use a1 Edit '{"file_path": "/w/src/a.rs"}'
+  use e1 Bash '{"command": "cargo test"}'
+} >"$CL/none.jsonl"
+eq "no handoff: nothing" "" "$(ctx_after_handoff "$CL/none.jsonl")"
+{
+  use h1 "$EK" '{"kind": "handoff", "text": "x"}'
+  result h1 'CONFLICT: task 7 is done'
+  use b1 Edit '{"file_path": "/w/src/b.rs"}'
+} >"$CL/refused.jsonl"
+eq "a handoff ekko refused: no handoff" "" "$(ctx_after_handoff "$CL/refused.jsonl")"
+{
+  cat "$CL/after.jsonl"
+  use h2 "$EK" '{"kind": "handoff", "text": "y"}'
+  result h2 '{"ok":true,"items":[{"id":1180}]}'
+  use c2 Write '{"file_path": "/w/docs/c.md"}'
+} >"$CL/twice.jsonl"
+eq "two handoffs: what came after the last" \
+  "ctx: the session this /clear ended went on after its handoff (ekko 1180). It changed 1 file(s): docs/c.md. The handoff does not cover these: check them against it before acting on it." \
+  "$(ctx_after_handoff "$CL/twice.jsonl")"
+{
+  use h3 mcp__plugin_ekko_ekko__batch '{"ops": "[{\"op\":\"create\",\"kind\":\"handoff\",\"text\":\"x\"}]"}'
+  result h3 '{"ok":true,"items":[{"id":5},{"id":6}]}'
+  use b1 Edit '{"file_path": "/elsewhere/b.rs"}'
+} >"$CL/batch.jsonl"
+eq "a handoff in a batch: counted, the path outside the folder whole" \
+  "ctx: the session this /clear ended went on after its handoff. It changed 1 file(s): /elsewhere/b.rs. The handoff does not cover these: check them against it before acting on it." \
+  "$(ctx_after_handoff "$CL/batch.jsonl")"
+# cj <event> <reason or source> <transcript> -- a SessionEnd or SessionStart input
+cj() {
+  jq -nc --arg e "$1" --arg w "$2" --arg t "$3" \
+    '{hook_event_name: $e, session_id: "s", transcript_path: $t} + (if $e == "SessionEnd" then {reason: $w} else {source: $w} end)'
+}
+# clear_pair <end input> <start input> -- the start's output, both hooks run
+# by one process named claude, as Claude Code runs them around a /clear
+clear_pair() {
+  # shellcheck disable=SC2016 # $0, $1 and $2 are the inner shell's
+  "$FAKEBIN/claude" -c 'printf "%s" "$1" | "$0" end; printf "%s" "$2" | "$0" start' "$HOOKS/cleared" "$1" "$2" 2>&1
+}
+out=$(clear_pair "$(cj SessionEnd clear "$CL/after.jsonl")" "$(cj SessionStart clear "$CL/fresh.jsonl")")
+has "a /clear: the fresh session is told" present "went on after its handoff (ekko 1170)" "$(told "$out")"
+eq "...as SessionStart's context" SessionStart "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.hookEventName' 2>/dev/null)"
+eq "...and the mark is taken" "" "$(ls "$CTX_STATE/cleared" 2>/dev/null)"
+eq "nothing after the handoff: nothing told" "" \
+  "$(clear_pair "$(cj SessionEnd clear "$CL/nothing.jsonl")" "$(cj SessionStart clear "$CL/fresh.jsonl")")"
+eq "a session that ended otherwise: nothing told" "" \
+  "$(clear_pair "$(cj SessionEnd prompt_input_exit "$CL/after.jsonl")" "$(cj SessionStart clear "$CL/fresh.jsonl")")"
+# The '; true' keeps the shell named claude the hook's parent: bash runs a lone
+# command in its own place, and the hook would find whatever claude runs the
+# suite -- the same one for both.
+# shellcheck disable=SC2016 # $0 is the hook, for the inner shell
+cj SessionEnd clear "$CL/after.jsonl" | "$FAKEBIN/claude" -c '"$0" end; true' "$HOOKS/cleared"
+eq "the end alone: its mark is left" 1 "$(find "$CTX_STATE/cleared" -type f 2>/dev/null | wc -l)"
+# shellcheck disable=SC2016 # $0 is the hook, for the inner shell
+eq "the end in one process, the start in another: nothing told" "" \
+  "$(cj SessionStart clear "$CL/fresh.jsonl" | "$FAKEBIN/claude" -c '"$0" start; true' "$HOOKS/cleared" 2>&1)"
+eq "a session that started otherwise: nothing told" "" \
+  "$(clear_pair "$(cj SessionEnd clear "$CL/after.jsonl")" "$(cj SessionStart startup "$CL/fresh.jsonl")")"
+rm -rf "$CTX_STATE/cleared"
+
 # --- cold return (UserPromptSubmit) -------------------------------------------------
 # A prompt that comes back to a big session past the cache's hour is stopped
 # once, with the cost and the handoff's age; sent again it goes through, and so

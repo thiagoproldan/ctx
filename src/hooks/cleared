@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# SessionEnd and SessionStart around a /clear: tell the fresh session what the
+# session the /clear ended did after its last handoff (task 6 on ctx's board).
+#
+# The status line shows a handoff's age (⚑ handoff 80k ago), but a /clear after
+# a stale handoff leaves the next session that handoff alone: what was done
+# after it is lost unless the session wrote it down. The host restores that
+# better than the model retypes it, as Context Language Models' resume does
+# (github.com/facebookresearch/context-language-models,
+# clm/clm_harness/utils/resume.py): "a model asked to retype several KB of
+# state truncates it".
+#
+# No input of SessionStart names the session a /clear ended: its session id
+# and transcript are the fresh session's. SessionEnd's, reason "clear", are
+# the ended one's, and Claude Code runs it first, in the same process:
+# measured on 2026-10-09 (Claude Code 2.1.295), the SessionEnd hook of a
+# /clear, held a second by a sleep, ended 48 ms before the fresh session's
+# SessionStart hook began, both under one pid. So the end leaves the ended
+# transcript's path under that process -- its pid and start time, which no
+# later process shares -- and the start takes it.
+#
+# Usage: cleared end (SessionEnd) | cleared start (SessionStart). What is told
+# is lib/handoff.sh's ctx_after_handoff: the files the ended session changed
+# after the last handoff it wrote, and its last commands; nothing when it
+# wrote none, or did nothing after it.
+set -u
+
+[ "${CTX_DISABLE:-0}" = "1" ] && exit 0
+
+STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/handoff.sh
+. "$ROOT/lib/handoff.sh"
+
+event="${1:-}"
+input=$(cat)
+why="" transcript=""
+eval "$(printf '%s' "$input" | jq -r '
+  @sh "why=\(.reason // .source // "" | tostring) transcript=\(.transcript_path // "" | tostring)"
+' 2>/dev/null)" 2>/dev/null
+[ "$why" = "clear" ] || exit 0
+
+pid=$(ctx_claude_pid) || exit 0
+# The process's start, in clock ticks since boot: field 22 of its stat, the
+# 20th after the name in parentheses.
+started=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{ print $20 }')
+case "$started" in '' | *[!0-9]*) exit 0 ;; esac
+mark="$STATE/cleared/$pid-$started"
+
+case "$event" in
+end)
+  [ -n "$transcript" ] || exit 0
+  # Marks a start never took: a process that died between the two.
+  find "$STATE/cleared" -type f -mmin +1440 -delete 2>/dev/null
+  { mkdir -p "$STATE/cleared" && printf '%s\n' "$transcript" >"$mark"; } 2>/dev/null
+  ;;
+start)
+  [ -r "$mark" ] || exit 0
+  ended=""
+  read -r ended <"$mark"
+  rm -f -- "$mark"
+  # The fresh session's own transcript is not the one to read.
+  [ -n "$ended" ] && [ "$ended" != "$transcript" ] || exit 0
+  text=$(ctx_after_handoff "$ended")
+  [ -n "$text" ] || exit 0
+  jq -n --arg m "$text" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $m}}'
+  ;;
+esac
+exit 0

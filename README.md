@@ -60,6 +60,9 @@ plugin, the same way ekko is.
      `/handoff` (see _The handoff_).
    - `handoff-written` — `PostToolUse` on ekko's `create` and `batch`: notes the
      context at which the session wrote a handoff, so its age can be shown.
+   - `cleared` — `SessionEnd` on `/clear`, then `SessionStart`: tells the
+     fresh session what the ended one did after its last handoff (see _The
+     handoff_).
    - `cold-return` — `UserPromptSubmit`, off by default: with `CTX_COLD_TOKENS`
      set (250000, the Stop hook's threshold), a prompt that comes back to a
      context that big after `CTX_COLD_MINUTES` (60) idle, when the prompt cache
@@ -136,6 +139,19 @@ every so often would hold a turn each time, in exactly those sessions. So the
 (`$CTX_STATE/handoff/<session>.written`), and the status line shows the age:
 `✓ handoff 5k ago` while it is fresh, `⚑ handoff 80k ago` once the session has
 gone on, which is the cue to run `/handoff` before the `/clear`.
+
+A `/clear` after a stale handoff still leaves the next session that handoff
+alone. So the `cleared` hook tells the fresh session what the ended one did
+after its last handoff, as Context Language Models' resume restores state
+instead of having the model retype it: the files it edited or wrote, and its
+last commands — `ctx: the session this /clear ended went on after its
+handoff (ekko 1192). It changed 2 file(s): … Its last commands: …` — and
+nothing when it wrote no handoff, or did nothing after it. No input of
+`SessionStart` names the session a `/clear` ended; `SessionEnd`'s, reason
+`clear`, does, and Claude Code runs it first, in the same process (measured
+on 2026-10-09: it ended 48 ms before the fresh session's `SessionStart`
+began). The end leaves the ended transcript's path under that process, in
+`$CTX_STATE/cleared/<pid>-<start>`, and the start takes it.
 
 ### Coming back to a cold cache
 

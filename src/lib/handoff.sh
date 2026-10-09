@@ -136,3 +136,69 @@ ctx_auto_busy() {
   *) kill -0 "$pid" 2>/dev/null ;;
   esac
 }
+
+# ctx_claude_pid -- Claude Code's own pid: the nearest ancestor of this hook
+# named after it.
+ctx_claude_pid() {
+  local p=$PPID c
+  while [ "${p:-0}" -gt 1 ]; do
+    c=$(cat "/proc/$p/comm" 2>/dev/null)
+    case "$c" in *claude*)
+      echo "$p"
+      return 0
+      ;;
+    esac
+    p=$(awk '$1 == "PPid:" { print $2 }' "/proc/$p/status" 2>/dev/null)
+  done
+  return 1
+}
+
+# ctx_after_handoff <transcript> -- what the session that wrote <transcript>
+# did after the last handoff it wrote through ekko, in one paragraph: the
+# files it edited or wrote, and its last commands. Nothing when it wrote no
+# handoff, or did nothing after it; a write ekko refused is no handoff, and
+# subagents' rows are left out.
+ctx_after_handoff() {
+  [ -r "${1:-}" ] || return 0
+  jq -nrR '
+    def ok: [.. | strings] | join(" ") | test("\"ok\"\\s*:\\s*true");
+    def handoff: ((.name // "") | test("ekko"))
+      and (.input.kind == "handoff"
+           or ([.input.ops // [] | if type == "string" then (fromjson? // []) else . end
+                | arrays | .[] | objects | select(.op == "create" and .kind == "handoff")]
+               | length > 0));
+    def items: .message.content // [] | if type == "array" then .[] else empty end | objects;
+    reduce (inputs | fromjson? | objects | select(.isSidechain != true)) as $r
+      ({asked: {}, seen: false, id: null, files: [], cmds: [], cwd: ""};
+       .cwd = ($r.cwd // .cwd)
+       | if $r.type == "assistant" then
+           reduce ($r | items | select(.type == "tool_use")) as $u (.;
+             if ($u | handoff) then .asked[$u.id // ""] = ($u.name | test("create"))
+             elif ($u.name // "" | IN("Edit", "Write", "MultiEdit", "NotebookEdit")) then
+               ($u.input.file_path // $u.input.notebook_path) as $f
+               | if $f then .files = (.files - [$f] + [$f]) else . end
+             elif $u.name == "Bash" then .cmds += [$u.input.command // "" | tostring]
+             else . end)
+         elif $r.type == "user" then
+           reduce ($r | items | select(.type == "tool_result")) as $t (.;
+             if (.asked | has($t.tool_use_id // "")) and ($t | ok) then
+               .id = (if .asked[$t.tool_use_id] then
+                        [$t | .. | strings | capture("\"id\"\\s*:\\s*(?<n>[0-9]+)") | .n] | first
+                      else null end)
+               | .seen = true | .files = [] | .cmds = []
+             else . end)
+         else . end)
+    | select(.seen and (.files | length) + (.cmds | length) > 0)
+    | .cwd as $cwd
+    | (.files | map(if $cwd != "" and startswith($cwd + "/") then .[($cwd | length) + 1:] else . end)) as $files
+    | (.cmds | .[-5:] | map(split("\n")[0] | if length > 120 then .[:117] + "..." else . end)) as $cmds
+    | "ctx: the session this /clear ended went on after its handoff"
+      + (if .id then " (ekko \(.id))" else "" end) + "."
+      + (if ($files | length) > 0 then
+           " It changed \($files | length) file(s): " + ($files | .[-12:] | join(", "))
+           + (if ($files | length) > 12 then ", and earlier ones" else "" end) + "."
+         else "" end)
+      + (if ($cmds | length) > 0 then " Its last commands: " + ($cmds | map("`" + . + "`") | join("; ")) + "." else "" end)
+      + " The handoff does not cover these: check them against it before acting on it."
+  ' <"$1" 2>/dev/null
+}

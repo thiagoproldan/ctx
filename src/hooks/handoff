@@ -107,22 +107,6 @@ fi
 
 tokens=$(ctx_context_tokens "$transcript")
 
-# claude_pid -- Claude Code's own pid: the nearest ancestor of this hook
-# named after it.
-claude_pid() {
-  local p=$PPID c
-  while [ "${p:-0}" -gt 1 ]; do
-    c=$(cat "/proc/$p/comm" 2>/dev/null)
-    case "$c" in *claude*)
-      echo "$p"
-      return 0
-      ;;
-    esac
-    p=$(awk '$1 == "PPid:" { print $2 }' "/proc/$p/status" 2>/dev/null)
-  done
-  return 1
-}
-
 five="" resets="" seven="" seven_resets=""
 read -r five resets seven seven_resets <<<"$(ctx_window)"
 five=$(int_or "${five:-}" "")
@@ -165,7 +149,7 @@ past=0
 if [ "$idle_min" -gt 0 ] && { [ "$past" -eq 1 ] || [ "$resumable" -eq 1 ]; } &&
   [ "$unshelled" -eq 0 ] && [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "cli" ] &&
   [ -n "${KONSOLE_DBUS_SERVICE:-}" ] && [ -n "${KONSOLE_DBUS_SESSION:-}" ] &&
-  cpid=$(claude_pid); then
+  cpid=$(ctx_claude_pid); then
   known=0 ended=0 gone=0
   read -r _ _ known ended <<<"$(ctx_last_human "$transcript" "$STATE/auto/$sid.typed")"
   ended=$(int_or "${ended:-}" 0)
