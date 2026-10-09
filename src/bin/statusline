@@ -12,14 +12,15 @@
 # and clear, before a limit stop leaves a huge context to resume cold (a
 # single cold resume measured 332k-1.86M input-equivalent units).
 #
-# It also leaves the account's 5-hour reading where the hooks find it
-# (lib/window.sh): no hook's input carries the rate limits, and the status
-# line is the only place Claude Code hands them out. The Stop hook adds the
-# cap to the handoff it asks of a session left alone, hooks/window tells the
-# model where it stands, and hooks/guard-window refuses new work past the cap
-# (ekko task 808). With the user there, the flag below is the only cue: the
-# Stop hook asks nothing, and the moment is the user's /handoff (ekko task
-# 961).
+# It also leaves the account's 5-hour and 7-day reading where the hooks find
+# it (lib/window.sh): no hook's input carries the rate limits, and the status
+# line is the only place Claude Code hands them out. The Stop hook adds a cap
+# to the handoff it asks of a session left alone, hooks/window tells the
+# model where it stands, and hooks/guard-window refuses new work past either
+# cap (ekko task 808). With the user there, the flags below are the only cue:
+# the Stop hook asks nothing, and the moment is the user's /handoff (ekko task
+# 961). Past its cap the week shows on any terminal, with the day it resets:
+# at 100% Claude Code stops answering until then.
 #
 # Once this session has written a handoff (hooks/handoff-written notes the
 # context it was written at), the context segment says how old it is:
@@ -33,6 +34,7 @@
 #                       a replay of 30 days of sessions: ~90% of what 200k
 #                       saves, with ~30% fewer resets)
 #   CTX_HANDOFF_5H      5-hour window percentage          (default 85)
+#   CTX_HANDOFF_7D      7-day window percentage           (default 95)
 #   CTX_CACHE_WARN_MIN  minutes left before a warm cache  (default 5)
 #                       is shown as about to go cold
 #   NO_COLOR            any value disables ANSI colour
@@ -41,6 +43,7 @@ set -u
 int_or() { case "${1:-}" in '' | *[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
 handoff_tokens=$(int_or "${CTX_HANDOFF_TOKENS:-}" 250000)
 handoff_5h=$(int_or "${CTX_HANDOFF_5H:-}" 85)
+handoff_7d=$(int_or "${CTX_HANDOFF_7D:-}" 95)
 cache_warn=$(int_or "${CTX_CACHE_WARN_MIN:-}" 5)
 cols=$(int_or "${COLUMNS:-}" 120)
 color=1
@@ -65,17 +68,18 @@ fi
 case "$written" in '' | *[!0-9]*) written=null ;; esac
 
 # One jq process: the status line runs after every assistant message and on a
-# timer, so it must stay cheap. Its first three lines are the reading for the
-# hooks (the 5-hour percentage, when that window ends, the 7-day percentage),
-# the fourth the status line. A malformed payload prints nothing rather than
-# an error in the footer.
+# timer, so it must stay cheap. Its first four lines are the reading for the
+# hooks (the 5-hour percentage, when that window ends, the 7-day percentage,
+# when the week ends), the fifth the status line. A malformed payload prints
+# nothing rather than an error in the footer.
 {
   IFS= read -r five || exit 0
   IFS= read -r resets || resets=""
   IFS= read -r seven || seven=""
+  IFS= read -r seven_resets || seven_resets=""
   IFS= read -r line || line=""
 } < <(jq -r \
-  --argjson ht "$handoff_tokens" --argjson h5 "$handoff_5h" --argjson hw "$written" \
+  --argjson ht "$handoff_tokens" --argjson h5 "$handoff_5h" --argjson h7 "$handoff_7d" --argjson hw "$written" \
   --argjson cw "$cache_warn" --argjson cols "$cols" --argjson color "$color" '
   def paint($code; $s): if $color == 1 then "[\($code)m\($s)[0m" else $s end;
   def k: if . >= 1000000 then "\(. / 100000 | floor | . / 10)M"
@@ -107,8 +111,15 @@ case "$written" in '' | *[!0-9]*) written=null ;; esac
              else "5h \($p)%\($r)" end
          end),
 
-      (if $cols >= 100 and .rate_limits.seven_day.used_percentage != null
-       then paint("2"; "7d \(.rate_limits.seven_day.used_percentage | floor)%") else empty end),
+      (.rate_limits.seven_day as $s
+       | if $s == null or $s.used_percentage == null then empty else
+           ($s.used_percentage | floor) as $p
+           | if $h7 > 0 and $p >= $h7 then
+               (if $s.resets_at == null then "" else " ↺\($s.resets_at | strflocaltime("%a %H:%M"))" end) as $r
+               | paint("31"; "7d \($p)%\($r) ⚑ handoff")
+             elif $cols >= 100 then paint("2"; "7d \($p)%")
+             else empty end
+         end),
 
       (.prompt_cache as $pc
        | if $pc == null or $pc.caching_observed != true then empty
@@ -128,8 +139,9 @@ case "$written" in '' | *[!0-9]*) written=null ;; esac
   | (.rate_limits.five_hour.used_percentage | if type == "number" then floor | tostring else "" end),
     (.rate_limits.five_hour.resets_at | if type == "number" then floor | tostring else "" end),
     (.rate_limits.seven_day.used_percentage | if type == "number" then floor | tostring else "" end),
+    (.rate_limits.seven_day.resets_at | if type == "number" then floor | tostring else "" end),
     $line
 ' <<<"$payload" 2>/dev/null)
 
-ctx_window_merge "$five" "$resets" "$seven"
+ctx_window_merge "$five" "$resets" "$seven" "$seven_resets"
 printf '%s\n' "$line"

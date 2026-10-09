@@ -403,6 +403,21 @@ has "7d window on a wide terminal" present "7d 41%" "$out"
 has "no miss, no miss segment" absent "miss" "$out"
 has "NO_COLOR: no escape codes" absent "${ESC}[" "$out"
 has "narrow terminal drops 7d" absent "7d" "$(sl "$(sl_json 45000 23.5 true 1830 0 "")" 80)"
+# sl7_json <7d percent> -- a payload whose week ends in about two days
+wk1=$((now + 200000))
+sl7_json() {
+  jq -nc --argjson p "$1" --argjson r "$((now + 3600))" --argjson w "$wk1" '
+    {model: {display_name: "Opus 5"}, context_window: {total_input_tokens: 45000},
+     rate_limits: {five_hour: {used_percentage: 10, resets_at: $r},
+                   seven_day: {used_percentage: $p, resets_at: $w}}}'
+}
+has "7d at 94%: no flag" absent "handoff" "$(sl "$(sl7_json 94.9)")"
+has "7d at 95%: handoff, and when the week resets" present "7d 95% ↺" "$(sl "$(sl7_json 95)")"
+has "...at its hour" present "$(date -d "@$wk1" +%H:%M) ⚑ handoff" "$(sl "$(sl7_json 95)")"
+has "...even on a narrow terminal" present "7d 95%" "$(sl "$(sl7_json 95)" 80)"
+has "...in red" present "${ESC}[31m7d 95%" "$(slc "$(sl7_json 95)")"
+has "CTX_HANDOFF_7D=0: no flag at 99%" absent "handoff" \
+  "$(sl7_json 99 | env NO_COLOR=1 CTX_HANDOFF_7D=0 "$SL")"
 has "249,999 tokens: still no handoff" absent "handoff" "$(sl "$(sl_json 249999 10 true 1830 0 "")")"
 has "250k tokens: handoff" present "ctx 250k ⚑ handoff" "$(sl "$(sl_json 250000 10 true 1830 0 "")")"
 has "handoff below 2x is yellow" present "${ESC}[33mctx 300k" "$(slc "$(sl_json 300000 10 true 1830 0 "")")"
@@ -430,32 +445,51 @@ has "malformed input: exit 0" present "rc=0" "$out"
 has "malformed input: nothing printed" absent "error" "$out"
 export CLAUDE_CONFIG_DIR="$TMP/profile"
 
-# --- the account's 5-hour window (lib/window.sh) -------------------------------------
+# --- the account's windows (lib/window.sh) ---------------------------------------------
 # Every session of an account leaves its reading in the same file, each with
 # what its own process last heard from the API: the readings of one window keep
 # the highest, a later window replaces them, an earlier one is dropped, and a
-# window that ended reads as none (ekko task 808).
-echo "5-hour window:"
+# window that ended reads as none (ekko task 808) -- the week by its own end.
+echo "5-hour and 7-day windows:"
 # shellcheck source=lib/window.sh
 . "$ROOT/lib/window.sh"
 at1=$((now + 3600)) at2=$((now + 3600 + 18000))
 w() { CLAUDE_CONFIG_DIR="$TMP/profile-w" "$@"; }
 w ctx_window_merge 60 "$at1" 40
 w ctx_window_merge 55 "$at1" 38
-eq "an idle session's older number: the highest stays" "60 $at1 40" "$(w ctx_window)"
+eq "an idle session's older number: the highest stays" "60 $at1 40 -" "$(w ctx_window)"
 w ctx_window_merge 12 "$at2" 41
-eq "a later window replaces it" "12 $at2 41" "$(w ctx_window)"
+eq "a later window replaces it" "12 $at2 41 -" "$(w ctx_window)"
 w ctx_window_merge 90 "$at1" 45
-eq "an earlier window is dropped" "12 $at2 41" "$(w ctx_window)"
+eq "an earlier window is dropped" "12 $at2 41 -" "$(w ctx_window)"
 w ctx_window_merge 20 $((at2 + 120)) -
-eq "the same window, its end rounded: the highest" "20 $((at2 + 120)) 41" "$(w ctx_window)"
+eq "the same window, its end rounded: the highest" "20 $((at2 + 120)) 41 -" "$(w ctx_window)"
 echo "95 $((now - 60)) 50" >"$CTX_STATE/window/profile-w"
 eq "a window that ended reads as none" "" "$(w ctx_window)"
+# The week can reset within a 5-hour window: it goes by its own end.
+wk2=$((wk1 + 604800))
+v() { CLAUDE_CONFIG_DIR="$TMP/profile-wk" "$@"; }
+v ctx_window_merge 30 "$at1" 97 "$wk1"
+v ctx_window_merge 31 "$at1" 96 "$wk1"
+eq "the week: the highest stays" "31 $at1 97 $wk1" "$(v ctx_window)"
+v ctx_window_merge 31 "$at1" 1 "$wk2"
+eq "...a later week replaces it, within 5 hours" "31 $at1 1 $wk2" "$(v ctx_window)"
+v ctx_window_merge 31 "$at1" 98 "$wk1"
+eq "...an earlier week is dropped" "31 $at1 1 $wk2" "$(v ctx_window)"
+v ctx_window_merge 32 "$at1" -
+eq "...a reading without the week keeps it" "32 $at1 1 $wk2" "$(v ctx_window)"
+echo "40 $at1 99 $((now - 60))" >"$CTX_STATE/window/profile-wk"
+eq "...a week that ended reads as unknown" "40 $at1 - -" "$(v ctx_window)"
+echo "40 $at1 99" >"$CTX_STATE/window/profile-wk"
+eq "...a reading ctx 0.10 left: the week without its end" "40 $at1 99 -" "$(v ctx_window)"
 eq "the account is the profile's folder" "claude-trabalho" "$(CLAUDE_CONFIG_DIR=/home/x/.claude-trabalho/ ctx_account)"
 eq "...~/.claude without the variable" "claude" "$(env -u CLAUDE_CONFIG_DIR HOME=/home/x bash -c '. "$0"; ctx_account' "$ROOT/lib/window.sh")"
 sl_json 45000 62.4 true 1830 0 "" | env NO_COLOR=1 CLAUDE_CONFIG_DIR="$TMP/profile-s" "$SL" >/dev/null
-eq "the status line leaves the account's reading" "62 $at1 41" "$(CLAUDE_CONFIG_DIR="$TMP/profile-s" ctx_window)"
-eq "one line for the model" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 41%" "$(ctx_window_line 62 "$at1" 41)"
+eq "the status line leaves the account's reading" "62 $at1 41 $at1" "$(CLAUDE_CONFIG_DIR="$TMP/profile-s" ctx_window)"
+eq "one line for the model" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 41% until $(LC_ALL=C date -d "@$wk1" '+%a %H:%M'), cap 95%" \
+  "$(ctx_window_line 62 "$at1" 41 "$wk1")"
+eq "...the week's end unknown" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 41%, cap 95%" "$(ctx_window_line 62 "$at1" 41 -)"
+eq "...no week" "5h 62% until $(date -d "@$at1" +%H:%M), cap 85%" "$(ctx_window_line 62 "$at1" -)"
 
 # --- window (SessionStart, UserPromptSubmit, PostToolUse) ------------------------------
 # The model is told the reading as a session starts and with every prompt, and
@@ -476,7 +510,7 @@ tool() { printf '{"session_id":"%s","tool_name":"Read"}' "$1" | wh tool; }
 eq "no reading: nothing said" "" "$(printf '{"session_id":"w1","source":"startup"}' | wh start)"
 CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 62 "$at1" 48
 out=$(printf '{"session_id":"w1","source":"startup"}' | wh start)
-eq "start: the reading in one line" "ctx: 5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 48%." "$(told "$out")"
+eq "start: the reading in one line" "ctx: 5h 62% until $(date -d "@$at1" +%H:%M), cap 85% · 7d 48%, cap 95%." "$(told "$out")"
 eq "...as SessionStart's context" "SessionStart" "$(printf '%s' "$out" | jq -r '.hookSpecificOutput.hookEventName')"
 has "prompt: the same line" present "ctx: 5h 62%" "$(told "$(printf '{"session_id":"w1","prompt":"oi","source":"user"}' | wh prompt)")"
 eq "tool, the same band: nothing" "" "$(tool w1)"
@@ -510,6 +544,27 @@ out=$({
   printf '"}'
 } | wh tool)
 has "a 2 MB tool input: read, and told" present "Past 70%" "$(told "$out")"
+# The week's cap does what the 5-hour cap does, and is told even past that one.
+PW="$TMP/profile-h7"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 90 "$at1" 94 "$wk1"
+has "the 5-hour cap crossed, told" present "Past the cap the rest of the window" "$(told "$(tool w7)")"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 90 "$at1" 95 "$wk1"
+out=$(tool w7)
+has "tool: the week's cap crossed past it, told" present "Past the cap on the 7-day window" "$(told "$out")"
+has "...and when Claude Code would stop" present "stops answering until $(LC_ALL=C date -d "@$wk1" '+%a %H:%M')" "$(told "$out")"
+eq "...once" "" "$(tool w7)"
+out=$(jq -nc '{session_id: "w7", prompt: "check", source: "loop_wakeup"}' | wh prompt)
+eq "past the week's cap: a wakeup held" "block" "$(held "$out")"
+has "...naming the week" present "the 7-day window is at 95%, past the 95% cap, until $(LC_ALL=C date -d "@$wk1" '+%a %H:%M')" "$(told "$out")"
+has "the user's prompt: what the week's cap asks" present "Past the cap on the 7-day window" \
+  "$(told "$(jq -nc '{session_id: "w7", prompt: "sigo?", source: "user"}' | wh prompt)")"
+PW="$TMP/profile-h8"
+CLAUDE_CONFIG_DIR="$PW" ctx_window_merge 10 "$at1" 99 "$wk1"
+eq "the week alone past its cap: a wakeup held" "block" \
+  "$(held "$(jq -nc '{session_id: "w8", prompt: "check", source: "loop_wakeup"}' | wh prompt)")"
+eq "CTX_HANDOFF_7D=0: nothing held" "" \
+  "$(held "$(jq -nc '{session_id: "w8", prompt: "check", source: "loop_wakeup"}' | wh prompt CTX_HANDOFF_7D=0)")"
+PW="$TMP/profile-h"
 
 # --- window guard (PreToolUse) ------------------------------------------------------
 # Past the cap, the work a session starts on its own is refused: a subagent, a
@@ -543,6 +598,19 @@ has "the reason names the window and the cap" present "the 5-hour window is at 8
 has "...and how to ask the user" present 'allow set to "abc123"' "$out"
 has "refusals are logged" present '"ev": "window-refuse"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
 has "...and the call let through" present '"ev": "window-excepted"' "$(cat "$CTX_STATE/guard.jsonl" 2>/dev/null)"
+PG="$TMP/profile-g7"
+CLAUDE_CONFIG_DIR="$PG" ctx_window_merge 10 "$at1" 94 "$wk1"
+gw "the week at 94%: a subagent goes" allow guard-window "$(tool_json Agent)"
+CLAUDE_CONFIG_DIR="$PG" ctx_window_merge 10 "$at1" 95 "$wk1"
+gw "the week at 95%: a subagent is refused" deny guard-window "$(tool_json Agent)"
+gw "...a new cron" deny guard-window "$(tool_json CronCreate)"
+gw "...claude -p" deny guard-window "$(bash_json 'claude -p "resume o repo"')"
+CTX_HANDOFF_7D=0 gw "CTX_HANDOFF_7D=0: no cap" allow guard-window "$(tool_json Agent)"
+out=$(tool_json Agent | env CLAUDE_CONFIG_DIR="$PG" EKKO_FAKE=refused "$HOOKS/guard-window" |
+  jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
+has "the reason names the week, its cap and its end" present \
+  "the 7-day window is at 95%, past the 95% cap, until $(LC_ALL=C date -d "@$wk1" '+%a %H:%M')" "$out"
+PG="$TMP/profile-g"
 
 # --- handoff (Stop) -----------------------------------------------------------------
 # With the user there, the hook asks nothing, past the threshold or the cap: the
@@ -739,27 +807,36 @@ mkdir -p "$CTX_STATE/window" && echo "95 $((now - 60)) -" >"$CTX_STATE/window/pr
 out=$(CLAUDE_CONFIG_DIR="$TMP/profile-ended" solo g 300000)
 is "alone, a reading whose window ended: the band's ask" ask "$out"
 has "...without the 5-hour window" absent "5-hour" "$out"
+CLAUDE_CONFIG_DIR="$TMP/profile-7h" ctx_window_merge 10 "$at1" 96 "$wk1"
+out=$(CLAUDE_CONFIG_DIR="$TMP/profile-7h" solo h7 300000)
+is "alone, 300k and the week at 96%: asks" ask "$out"
+has "...names the week" present "the 7-day usage window is at 96%, past 95%" "$out"
+has "...and what its cap asks" present "Past the cap on the 7-day window" "$out"
+is "the user there, the week at 96%: quiet" quiet "$(CLAUDE_CONFIG_DIR="$TMP/profile-7h" stop h7b 300000)"
 
 # The rule over the class (ekko task 961): with the user there, nothing ctx
 # says past the threshold and the cap tells the model to write a handoff by
 # itself. Every output such a session gets there is enumerated -- the Stop
 # hook, the window hook at start, prompt and tool, the window guard's refusal
 # -- and the ask a session alone gets, which must say it, is the check's no.
-PK="$TMP/profile-k"
-CLAUDE_CONFIG_DIR="$PK" ctx_window_merge 95 "$at1" 40
-present_said=$(
-  CLAUDE_CONFIG_DIR="$PK" AWAY=1 solo k1 300000
-  for ev in start prompt tool; do
-    jq -nc --arg s "k-$ev" '{session_id: $s, source: "startup", prompt: "oi", tool_name: "Read"}' |
-      env CLAUDE_CONFIG_DIR="$PK" "$WH" "$ev" 2>&1
-  done
-  tool_json Agent | env CLAUDE_CONFIG_DIR="$PK" EKKO_FAKE=refused "$HOOKS/guard-window" 2>&1
-)
-eq "the user there, past both: what is said" 4 "$(grep -o 'Past the cap' <<<"$present_said" | wc -l)"
-has "...the subagent refused among it" present "ctx refused a subagent" "$present_said"
-has "...and none of it asks for a handoff" absent "handoff" "$(tr '[:upper:]' '[:lower:]' <<<"$present_said")"
-has "alone, the ask does (the check's no)" present "handoff" \
-  "$(CLAUDE_CONFIG_DIR="$PK" solo k2 300000 | tr '[:upper:]' '[:lower:]')"
+CLAUDE_CONFIG_DIR="$TMP/profile-k5h" ctx_window_merge 95 "$at1" 40
+CLAUDE_CONFIG_DIR="$TMP/profile-k7d" ctx_window_merge 10 "$at1" 96 "$wk1"
+for cap in 5h 7d; do
+  PK="$TMP/profile-k$cap"
+  present_said=$(
+    CLAUDE_CONFIG_DIR="$PK" AWAY=1 solo "k$cap-1" 300000
+    for ev in start prompt tool; do
+      jq -nc --arg s "k$cap-$ev" '{session_id: $s, source: "startup", prompt: "oi", tool_name: "Read"}' |
+        env CLAUDE_CONFIG_DIR="$PK" "$WH" "$ev" 2>&1
+    done
+    tool_json Agent | env CLAUDE_CONFIG_DIR="$PK" EKKO_FAKE=refused "$HOOKS/guard-window" 2>&1
+  )
+  eq "the user there, past the threshold and the $cap cap: what is said" 4 "$(grep -o 'Past the cap' <<<"$present_said" | wc -l)"
+  has "...the subagent refused among it" present "ctx refused a subagent" "$present_said"
+  has "...and none of it asks for a handoff" absent "handoff" "$(tr '[:upper:]' '[:lower:]' <<<"$present_said")"
+  has "alone, the ask does (the check's no)" present "handoff" \
+    "$(CLAUDE_CONFIG_DIR="$PK" solo "k$cap-2" 300000 | tr '[:upper:]' '[:lower:]')"
+done
 
 # --- handoff written (PostToolUse) and its age ------------------------------------
 # Each handoff ekko accepts leaves the context it was written at, and nothing
@@ -1095,6 +1172,12 @@ rows "$TMP/ar-a9/s-a9.jsonl" 300000 human:40
 reset_env CLAUDE_CONFIG_DIR="$TMP/profile-c" "$AR" s-a9 "$TMP/ar-a9/s-a9.jsonl" $$
 eq "past the cap: /clear, and not the prompt" "'' /clear \$'\\r' " "$(sent)"
 has "...logged as held" present '"held":"cap"' "$(said s-a9)"
+CLAUDE_CONFIG_DIR="$TMP/profile-c7" ctx_window_merge 10 "$at1" 96 "$wk1"
+tab a11
+rows "$TMP/ar-a11/s-a11.jsonl" 300000 human:40
+reset_env CLAUDE_CONFIG_DIR="$TMP/profile-c7" "$AR" s-a11 "$TMP/ar-a11/s-a11.jsonl" $$
+eq "past the week's cap: /clear, and not the prompt" "'' /clear \$'\\r' " "$(sent)"
+has "...logged as held, naming the week" present '"held":"cap","window":"7d"' "$(said s-a11)"
 
 tab a5 busy
 rows "$TMP/ar-a5/s-a5.jsonl" 300000 human:40

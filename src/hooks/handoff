@@ -29,8 +29,9 @@
 # /clear into the next prompt they were writing (ekko task 967). Alone, it asks at most once per band: at
 # CTX_HANDOFF_TOKENS, again at twice that, and so on; a compaction that brings
 # the context back down re-arms the bands it came back under. Past the 5-hour
-# cap, CTX_HANDOFF_5H, the ask adds what the cap asks, once, and again only
-# after the window has come back under it. Never while a stop hook is already
+# cap, CTX_HANDOFF_5H, or the week's, CTX_HANDOFF_7D, the ask adds what the
+# cap asks, once, and again only after the reading has come back under both.
+# Never while a stop hook is already
 # continuing the turn. It asks even with background shells running, telling
 # Claude to name them in the handoff: a /clear does not drop a background
 # shell -- its notification reaches the fresh session (measured 2026-09-26,
@@ -41,10 +42,10 @@
 # cli), only past the threshold, only while the tab's foreground process is
 # this session's Claude Code, and not while anything but a background shell
 # is pending: a scheduled wakeup, a monitor or a subagent was not tested
-# across a /clear. So the 5-hour cap by itself never asks, and never resets: a
-# reset costs the window, it does not spare it. Past the cap on the window
-# (ekko task 808) bin/auto-reset types the /clear and not 'continuando': the
-# fresh session waits for the user, whose reserve the rest of the window is.
+# across a /clear. So a cap by itself never asks, and never resets: a reset
+# costs the window, it does not spare it. Past a cap (ekko task 808)
+# bin/auto-reset types the /clear and not 'continuando': the fresh session
+# waits for the user, whose reserve the rest of the window is.
 #
 # Alone, a handoff this session wrote that is still fresh -- less than a tenth
 # of the threshold of context since (hooks/handoff-written notes each one) --
@@ -62,7 +63,6 @@ set -u
 
 int_or() { case "${1:-}" in '' | *[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
 threshold=$(int_or "${CTX_HANDOFF_TOKENS:-}" 250000)
-limit_5h=$(int_or "${CTX_HANDOFF_5H:-}" 85)
 STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/handoff.sh
@@ -161,14 +161,16 @@ fi
 
 [ "$active" = "true" ] && exit 0
 
-five=""
-[ "$limit_5h" -gt 0 ] && read -r five _ <<<"$(ctx_window)"
+five="" resets="" seven="" seven_resets=""
+read -r five resets seven seven_resets <<<"$(ctx_window)"
 five=$(int_or "${five:-}" "")
+# The window past its cap, if any: "<5h|7d> <percent> <resets> <cap>".
+read -r hot_window hot_pct hot_at hot_cap <<<"$(ctx_window_hot "$five" "$resets" "$seven" "$seven_resets")"
 
 band=0
 [ "$threshold" -gt 0 ] && band=$((tokens / threshold))
 hot=0
-[ -n "$five" ] && [ "$five" -ge "$limit_5h" ] && hot=1
+[ -n "${hot_window:-}" ] && hot=1
 
 book="$STATE/handoff/$sid"
 was_band=0 was_hot=0
@@ -177,15 +179,15 @@ was_band=$(int_or "${was_band:-}" 0)
 was_hot=$(int_or "${was_hot:-}" 0)
 last_band=$was_band last_hot=$was_hot
 
-# Re-arm what came back down. Without a 5-hour reading -- none yet, or its
-# window ended -- its state is left as it was.
+# Re-arm what came back down. Without a reading -- none yet, or its 5-hour
+# window ended -- the caps' state is left as it was.
 [ "$band" -lt "$last_band" ] && last_band=$band
 [ -n "$five" ] && [ "$hot" -eq 0 ] && last_hot=0
 
 ask_tokens=0
 [ "$band" -gt "$last_band" ] && ask_tokens=1
-ask_5h=0
-[ "$hot" -eq 1 ] && [ "$last_hot" -eq 0 ] && ask_5h=1
+ask_cap=0
+[ "$hot" -eq 1 ] && [ "$last_hot" -eq 0 ] && ask_cap=1
 
 # record <band> <hot> -- a failed write must never take the hook down: the
 # worst case is one more ask, not a stuck session.
@@ -201,11 +203,11 @@ record() {
 # re-armed once nothing is due. Alone, background shells are no reason to
 # wait.
 quiet="$STATE/handoff/$sid.quiet"
-if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; }; then
+if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_cap" -eq 0 ]; }; then
   if [ "$last_band" != "$was_band" ] || [ "$last_hot" != "$was_hot" ]; then
     record "$last_band" "$last_hot"
   fi
-  if [ "$alone" -eq 0 ] && { [ "$ask_tokens" -eq 1 ] || [ "$ask_5h" -eq 1 ]; }; then
+  if [ "$alone" -eq 0 ] && { [ "$ask_tokens" -eq 1 ] || [ "$ask_cap" -eq 1 ]; }; then
     was_quiet=""
     [ -r "$quiet" ] && read -r was_quiet <"$quiet"
     if [ "$was_quiet" != "$band $hot $elsewhere" ]; then
@@ -213,7 +215,7 @@ if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; }; th
       tab=()
       [ "$elsewhere" -eq 1 ] && tab=(tab other away "$away")
       CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff-quiet "$sid" \
-        tokens "$tokens" five "$five" band "$band" "${tab[@]}"
+        tokens "$tokens" five "$five" seven "$seven" band "$band" "${tab[@]}"
     fi
   else
     rm -f -- "$quiet" 2>/dev/null
@@ -222,7 +224,7 @@ if [ "$alone" -eq 0 ] || { [ "$ask_tokens" -eq 0 ] && [ "$ask_5h" -eq 0 ]; }; th
 fi
 
 [ "$ask_tokens" -eq 1 ] && last_band=$band
-[ "$ask_5h" -eq 1 ] && last_hot=1
+[ "$ask_cap" -eq 1 ] && last_hot=1
 record "$last_band" "$last_hot"
 # Books of sessions long gone, and the readings each session kept before the
 # account's (ctx 0.7.0 and earlier).
@@ -233,11 +235,13 @@ k() { echo "$(($1 / 1000))k"; }
 why=""
 [ "$ask_tokens" -eq 1 ] &&
   why="this session's context is $(k "$tokens") tokens, past the $(k "$threshold") handoff threshold"
-[ "$ask_5h" -eq 1 ] &&
-  why="${why:+$why, and }the 5-hour usage window is at ${five}%, past ${limit_5h}%"
+name=5-hour
+[ "${hot_window:-}" = 7d ] && name=7-day
+[ "$ask_cap" -eq 1 ] &&
+  why="${why:+$why, and }the $name usage window is at ${hot_pct}%, past ${hot_cap}%"
 
 CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log handoff "$sid" \
-  tokens "$tokens" five "$five" band "$band" alone "$alone"
+  tokens "$tokens" five "$five" seven "$seven" band "$band" alone "$alone"
 
 # Alone, the reset follows the handoff by itself: the /clear above is ctx's to
 # type, and the fresh session is all that will know of a task still running.
@@ -253,7 +257,7 @@ Background tasks are still running, and their notifications will reach the fresh
 fi
 
 rule="Start no new work in this turn."
-[ "$hot" -eq 1 ] && rule="$rule $(ctx_window_rule)"
+[ "$hot" -eq 1 ] && rule="$rule $(ctx_window_rule "$hot_window" "$hot_at")"
 jq -n --arg m "ctx: $why. $(ctx_handoff_text "$ROOT")$auto
 $rule" \
   '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: $m}}'

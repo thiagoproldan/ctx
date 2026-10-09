@@ -1,9 +1,11 @@
-"""ctx's cap on the 5-hour window (ekko task 808, decision 863): past the cap,
-refuse the work a session starts on its own, and say why.
+"""ctx's caps on the 5-hour window and the week (ekko task 808, decision 863;
+the week's, task 2 on ctx's board): past either, refuse the work a session
+starts on its own, and say why.
 
 Reads Claude Code's PreToolUse JSON on stdin; hooks/guard-window runs this only
-once the account's window is at or past the cap (lib/window.sh), and passes the
-reading as its arguments: <five> <resets> <cap>. Refused, each with ekko's
+once one of the account's windows is at or past its cap (lib/window.sh), and
+passes that window as its arguments: <5h|7d> <percent> <resets> <cap>, resets
+"-" when unknown. Refused, each with ekko's
 allow-once, as the other guards are (ekko task 805):
   - a subagent: Agent, or Task as it was named before;
   - a new schedule: CronCreate, ScheduleWakeup;
@@ -38,7 +40,7 @@ def headless(command):
 
 
 def main():
-    five, resets, cap = (int(word) for word in sys.argv[1:4])
+    window, percent, resets, cap = sys.argv[1:5]
     event = json.load(sys.stdin)
     tool = event.get("tool_name") or ""
     sid = event.get("session_id") or ""
@@ -54,10 +56,16 @@ def main():
         what, rule = "a headless claude run", "headless"
     else:
         return
-    until = datetime.datetime.fromtimestamp(resets).strftime("%H:%M")
+    if window == "7d":
+        name, rest, shape = "7-day window", "week", "%a %H:%M"
+    else:
+        name, rest, shape = "5-hour window", "window", "%H:%M"
+    until = "it resets"
+    if resets.isdigit():
+        until = datetime.datetime.fromtimestamp(int(resets)).strftime(shape)
     reason = (
-        f"ctx refused {what}: the 5-hour window is at {five}%, past the {cap}% cap, until {until}. "
-        "Past the cap the rest of the window is the user's reserve: finish the step at hand and "
+        f"ctx refused {what}: the {name} is at {percent}%, past the {cap}% cap, until {until}. "
+        f"Past the cap the rest of the {rest} is the user's reserve: finish the step at hand and "
         "start nothing new."
     )
     refused = deny(reason, event)

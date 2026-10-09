@@ -24,10 +24,11 @@
 # changed: the box is read again before each backspace. Each wait -- for the turn to end, for the fresh session, for it to
 # settle -- lasts up to CTX_AUTO_RESET_WAIT seconds (300).
 #
-# Past the cap on the account's 5-hour window (lib/window.sh, ekko task 808),
-# read as the fresh session comes up, it types the /clear and not the prompt:
-# the fresh session costs nothing while it waits, and the rest of the window
-# is the user's. Logged as auto-reset with held "cap".
+# Past the cap on the account's 5-hour window or its week's (lib/window.sh,
+# ekko task 808), read as the fresh session comes up, it types the /clear and
+# not the prompt: the fresh session costs nothing while it waits, and the rest
+# of the window is the user's. Logged as auto-reset with held "cap" and the
+# window.
 set -u
 
 [ "${CTX_DISABLE:-0}" = "1" ] && exit 0
@@ -176,10 +177,10 @@ done
 [ -n "$fresh" ] || stop "no fresh session's transcript within ${wait_s}s of /clear"
 fsid=$(basename -- "$fresh" .jsonl)
 
-read -r five _ <<<"$(ctx_window)"
-cap=$(ctx_window_cap)
-if [ -n "${five:-}" ] && [ "$cap" -gt 0 ] && [ "$five" -ge "$cap" ]; then
-  log auto-reset "$sid" to "$fsid" held cap five "$five"
+read -r five resets seven seven_resets <<<"$(ctx_window)"
+read -r hot _ <<<"$(ctx_window_hot "${five:-}" "${resets:-}" "${seven:--}" "${seven_resets:--}")"
+if [ -n "${hot:-}" ]; then
+  log auto-reset "$sid" to "$fsid" held cap window "$hot" five "$five" seven "$seven"
   exit 0
 fi
 

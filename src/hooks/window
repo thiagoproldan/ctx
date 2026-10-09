@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Tells the model where the account's 5-hour window stands, and holds a
-# scheduled prompt past the cap (ekko task 808, decision 863).
+# Tells the model where the account's 5-hour and 7-day windows stand, and
+# holds a scheduled prompt past either cap (ekko task 808, decision 863; the
+# week's, task 2 on ctx's board).
 #
 # Usage, one per event: window start (SessionStart), window prompt
 # (UserPromptSubmit), window tool (PostToolUse on every tool).
 #
 #   start   the reading in one line, as the session begins or comes back from
-#           a /clear or a compaction: "ctx: 5h 62% until 21:40, cap 85% · 7d 48%".
-#   prompt  the same line with every prompt, and past the cap what the cap asks.
-#           A scheduled prompt past the cap -- a /loop wakeup, a cron's fire:
+#           a /clear or a compaction: "ctx: 5h 62% until 21:40, cap 85% · 7d
+#           48% until Sat 21:00, cap 95%".
+#   prompt  the same line with every prompt, and past a cap what it asks.
+#           A scheduled prompt past a cap -- a /loop wakeup, a cron's fire:
 #           the input's source, loop_wakeup or schedule_wakeup -- is held, and
 #           a recurring one fires again after the window resets. A prompt
 #           without a source counts as the user's (Claude Code says payloads
 #           may omit it while the field rolls out), and so does ctx's own
 #           'continuando', which bin/auto-reset does not type past the cap.
-#   tool    mid-turn, once, when the window crosses 70% or the cap: a turn left
-#           alone can run for hours between two prompts.
+#   tool    mid-turn, once, when the 5-hour window crosses 70% or its cap, or
+#           the week its cap: a turn left alone can run for hours between two
+#           prompts.
 #
 # The reading is the one bin/statusline leaves for the account (lib/window.sh);
 # without one -- no status line yet, or its window ended -- nothing is said.
@@ -44,9 +47,9 @@ sid=""
 # The session id names a file below: nothing that could leave the directory.
 case "$sid" in '' | */* | .*) exit 0 ;; esac
 
-read -r five resets seven <<<"$(ctx_window)"
+read -r five resets seven seven_resets <<<"$(ctx_window)"
 [ -n "${five:-}" ] || exit 0
-band=$(ctx_window_band "$five")
+band=$(ctx_window_band "$five" "$seven")
 told="$STATE/window/told/$sid"
 was=""
 [ -r "$told" ] && read -r was <"$told"
@@ -60,10 +63,11 @@ if [ "$event" = "tool" ] && [ "$band" -le "$was" ]; then
   exit 0
 fi
 
-say="ctx: $(ctx_window_line "$five" "$resets" "$seven")."
+say="ctx: $(ctx_window_line "$five" "$resets" "$seven" "$seven_resets")."
 case "$band" in
   1) say="$say Past 70%: pace the work, and start nothing long -- a paired run, a sweep of subagents -- that the rest of the window may not hold." ;;
   2) say="$say $(ctx_window_rule)" ;;
+  3) say="$say $(ctx_window_rule 7d "$seven_resets")" ;;
 esac
 
 # shellcheck source=../lib/ledger.sh
@@ -77,9 +81,12 @@ case "$event" in
     ;;
   prompt)
     source=$(printf '%s' "$input" | jq -r '.source // ""' 2>/dev/null)
-    if [ "$band" -eq 2 ] && { [ "$source" = loop_wakeup ] || [ "$source" = schedule_wakeup ]; }; then
-      CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log window-held "$sid" source "$source" five "$five"
-      jq -n --arg r "ctx held this scheduled prompt: the 5-hour window is at ${five}%, past the $(ctx_window_cap)% cap, until $(date -d "@$resets" +%H:%M). The rest of the window is the user's reserve; a recurring schedule fires again after the window resets." \
+    if [ "$band" -ge 2 ] && { [ "$source" = loop_wakeup ] || [ "$source" = schedule_wakeup ]; }; then
+      read -r window pct at cap <<<"$(ctx_window_hot "$five" "$resets" "$seven" "$seven_resets")"
+      name="5-hour window" rest="window"
+      [ "$window" = 7d ] && name="7-day window" rest="week"
+      CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log window-held "$sid" source "$source" five "$five" seven "$seven"
+      jq -n --arg r "ctx held this scheduled prompt: the $name is at ${pct}%, past the ${cap}% cap, until $(ctx_window_until "$window" "$at"). The rest of the $rest is the user's reserve; a recurring schedule fires again after the window resets." \
         '{decision: "block", reason: $r}'
       exit 0
     fi
@@ -88,7 +95,7 @@ case "$event" in
     ;;
   tool)
     tell
-    CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log window-crossed "$sid" band "$band" five "$five"
+    CTX_FUNNEL="$STATE/handoff.jsonl" ctx_log window-crossed "$sid" band "$band" five "$five" seven "$seven"
     emit PostToolUse "$say"
     ;;
 esac

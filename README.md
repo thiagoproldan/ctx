@@ -41,11 +41,13 @@ plugin, the same way ekko is.
      that would bring secret material into the context, and says what (see
      _The secrets guard_).
    - `guard-window` — `PreToolUse` on `Agent`, `Task`, `CronCreate`,
-     `ScheduleWakeup` and `Bash`: past the cap on the 5-hour window, denies the
-     work a session starts on its own (see _The 5-hour cap_).
+     `ScheduleWakeup` and `Bash`: past the cap on the 5-hour window or the
+     week's, denies the work a session starts on its own (see _The usage
+     caps_).
    - `window` — `SessionStart`, `UserPromptSubmit` and `PostToolUse` on every
-     tool: tells the model where the account's 5-hour window stands, and holds
-     a scheduled prompt past the cap (see _The 5-hour cap_).
+     tool: tells the model where the account's 5-hour and 7-day windows
+     stand, and holds a scheduled prompt past either cap (see _The usage
+     caps_).
    - `announce-graph` — `SessionStart`: if the project has a graphify index, say
      so on turn zero.
    - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
@@ -113,10 +115,10 @@ once, to `$CTX_STATE/handoff.jsonl` as `handoff-quiet`. With the user away
   it came back under. A band crossed with the user there is still owed, and
   asked once the user is away;
 - past the threshold, asks again when the 5-hour window passes its cap,
-  `CTX_HANDOFF_5H`, once, re-armed when a later window comes in under it. It
-  reads the account's reading (see _The 5-hour cap_), and past the cap the
-  ask adds what the cap asks: start nothing new. The cap by itself asks
-  nothing;
+  `CTX_HANDOFF_5H`, or the week its own, `CTX_HANDOFF_7D`, once, re-armed
+  when the reading comes back under both. It reads the account's reading
+  (see _The usage caps_), and past a cap the ask adds what the cap asks:
+  start nothing new. A cap by itself asks nothing;
 - stays quiet while a stop hook is already continuing the turn;
 - once a handoff this session wrote is fresh — less than a tenth of the
   threshold of context since it — starts the reset instead of a second ask;
@@ -274,12 +276,12 @@ Enter typed into one would approve the call. What was measured on 2026-09-26
 
 A prompt typed this way is recorded as the user's own, so the rows ctx
 typed are listed in `$CTX_STATE/auto/<session>.typed` and passed over when
-presence is read. The 5-hour trigger never resets: a reset spends the window,
-it does not spare it. And past the cap on the window, the reset types the
-`/clear` and not `continuando`: the fresh session costs nothing while it
-waits for the user, whose reserve the rest of the window is.
+presence is read. A cap never resets by itself: a reset spends the window,
+it does not spare it. And past a cap, the reset types the `/clear` and not
+`continuando`: the fresh session costs nothing while it waits for the user,
+whose reserve the rest of the window is.
 
-## The 5-hour cap
+## The usage caps
 
 The user, 2026-09-26: tell the model where the 5-hour limit stands, cap it at
 85%, and keep the last 15% for emergencies or anything else. The cap is
@@ -289,24 +291,37 @@ rest of the window is the user's. Nothing tells the model to write a handoff
 by itself: that is the user's `/handoff`, and the Stop hook's ask to a session
 left alone (_The handoff_).
 
+**The week.** At 100% of the 7-day window Claude Code stops answering until
+the week resets, days later, and a session can end there with no handoff:
+on 2026-10-02 one watched the reading by hand and wrote its handoff at 98%.
+So the week has a cap too, `CTX_HANDOFF_7D` (95; 0 turns it off), which does
+all the 5-hour cap does. One point of the week cost 6-8 points of the 5-hour
+window that day, so 95%, floored, leaves the user 4-5 points: some 24-40
+points of a 5-hour window. Past it the status line shows the week on any
+terminal, with the day it resets (`7d 96% ↺Sun 11:11 ⚑ handoff`), and what
+the model is told names it.
+
 **The reading.** Only the status line is handed the rate limits; no hook's
 input carries them (Claude Code 2.1.283). So `ctx-statusline` leaves one
 reading per account in `$CTX_STATE/window/<account>`, named after the
 profile's folder (`CLAUDE_CONFIG_DIR`, `~/.claude` by default): the 5-hour
-percentage, when that window ends, and the 7-day percentage. Every session of
-the account writes the same file, each with the numbers its own process last
-heard from the API, and an idle session's status line, refreshed every 30
-seconds, repeats an old one. Usage never falls within a window, so the readings
-of one window keep the highest, a later window replaces them, and one of an
-earlier window is dropped. A reading at the cap stands until its window ends,
-however old it is, and a window that has ended reads as none.
+percentage, when that window ends, the 7-day percentage and when the week
+ends. Every session of the account writes the same file, each with the
+numbers its own process last heard from the API, and an idle session's
+status line, refreshed every 30 seconds, repeats an old one. Usage never
+falls within a window, so the readings of one window keep the highest, a
+later window replaces them, and one of an earlier window is dropped — the
+week by its own end, since it can reset within a 5-hour window. A reading at
+a cap stands until its window ends, however old it is, and a window that has
+ended reads as none.
 
 **What the model is told.** One line as a session starts and with every
-prompt — `ctx: 5h 62% until 21:40, cap 85% · 7d 48%.` — and, mid-turn, once,
-when the window crosses 70% (pace the work; start nothing long) or the cap. A
-turn left alone can run for hours between two prompts.
+prompt — `ctx: 5h 62% until 21:40, cap 85% · 7d 48% until Sun 11:11, cap
+95%.` — and, mid-turn, once, when the 5-hour window crosses 70% (pace the
+work; start nothing long) or its cap, or the week its cap, even past the
+5-hour one. A turn left alone can run for hours between two prompts.
 
-**What the cap holds back.** Past the cap:
+**What a cap holds back.** Past either cap:
 
 - `guard-window` refuses a subagent (`Agent`, or `Task` as it was named
   before), a new schedule (`CronCreate`, `ScheduleWakeup`) and a Bash call that
@@ -321,8 +336,7 @@ turn left alone can run for hours between two prompts.
 - `bin/auto-reset` types the `/clear` and not `continuando`.
 
 The user's own prompt goes through, with the reading and what the cap asks:
-the reserve is theirs to spend. The week has no cap; its percentage is in the
-line.
+the reserve is theirs to spend.
 
 ## The work-loss guard
 
@@ -560,6 +574,7 @@ invalidated or cold (10%), and the output. So it shows:
 | `ctx 410k ⚑ handoff 80k ago`                             | the session went on past it: `/handoff` again before the `/clear`     |
 | `5h 87% ↺14:30 ⚑ handoff`                                | 5-hour window and its reset; handoff from `CTX_HANDOFF_5H`          |
 | `7d 41%`                                                 | 7-day window, on terminals at least 100 columns wide                  |
+| `7d 96% ↺Sun 11:11 ⚑ handoff`                            | the week past `CTX_HANDOFF_7D`, on any terminal, and when it resets   |
 | `cache ● 38m` / `cache ○ cold, next call re-caches 612k` | minutes until the cache goes cold, or what the next call will rewrite |
 | `miss ×2 tools_changed`                                  | cache misses this session and the last cause Claude Code diagnosed    |
 
@@ -584,6 +599,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `GRAPHIFY_OUT`          | `graphify-out`            | Read, never set here — honours graphify's own                      |
 | `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
 | `CTX_HANDOFF_5H`        | `85`                      | The cap on the 5-hour window: no new work past it (0 off)          |
+| `CTX_HANDOFF_7D`        | `95`                      | The cap on the 7-day window: no new work past it (0 off)           |
 | `CTX_CACHE_WARN_MIN`    | `5`                       | Status line: minutes left before cache is cold                     |
 | `CTX_COLD_TOKENS`       | `0`                       | Cold-return hook: context worth stopping a prompt for (0 off)      |
 | `CTX_COLD_MINUTES`      | `60`                      | Cold-return hook: idle minutes that make the cache cold (0 off)    |
