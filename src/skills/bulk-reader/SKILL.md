@@ -27,6 +27,13 @@ subscription) and **never enter your context** — only the answer does. It also
 does not spend Claude quota. Each call is independent: for a follow-up, call
 again with the same `--paths`; resending the files costs you nothing.
 
+**One call carries about 175 KB of source.** What the worker is sent, line
+numbers included (~8% on source), stops at 190,000 bytes: `agy` cuts a
+message at 192,000, and the question goes last. A call past it is refused
+before the worker runs: split the files across calls and put the answers
+together. A reply showing the worker never saw the end of its message is an
+error too, not an answer.
+
 Lines are numbered before they reach the worker, so line citations in the answer
 are copied from the file, not counted. Still, **verify on disk** (`sed -n 'N,Mp'`)
 any exact line or value before using it in an edit — the answer is a summary,
@@ -41,4 +48,5 @@ files and pipes included — so splitting a dump into ten small `cat`s does not
 get around them; delegating does.
 
 Variables: `CTX_MODEL` (default `gemini-3.8-flash-medium`), `CTX_TIMEOUT_SECONDS`
-(300), `CTX_MAX_PAYLOAD_BYTES` (2000000 ≈ 500k tokens).
+(300), `CTX_MAX_PAYLOAD_BYTES` (190000: what the worker is sent, numbered lines
+and instructions included).

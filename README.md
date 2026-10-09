@@ -457,7 +457,18 @@ Two things about `agy` had to be dealt with:
 
 - **No stdin for `-p`, and argv caps one argument at 128 KB.** The turn goes in
   as one NDJSON event through `--input-format stream-json`, which does read stdin.
-  The cap becomes the worker's context (`CTX_MAX_PAYLOAD_BYTES`, 2 MB).
+- **`agy` cuts a message at 192,000 bytes**, whatever it holds: measured on
+  1.2.16 with numbered lines of code, of hex and of accented text, each cut
+  within a line of byte 192,000, though the model's window is 1M tokens. The
+  end is where `bulk-read`'s question goes: 5 of 5 calls past ~190 KB on
+  2026-10-07 answered without it, one with a plausible summary. So the cap,
+  `CTX_MAX_PAYLOAD_BYTES` (190,000), is on what `agy` is sent, instructions
+  included, and a call past it is refused before the worker runs, saying to
+  split it. The message also ends with a mark the reply must start with: a
+  worker that never saw the end cannot, and the call fails instead of
+  answering without its question, wherever a later `agy` moves its cut.
+  `ctx-test --live` sends a message just under the cap and checks it arrives
+  whole.
 - **`agy` is an agent with every tool auto-approved in print mode** —
   `run_command`, `write_to_file`, web access — and no flag turns that off
   (`--mode plan` does not; measured). The worker reads untrusted text, so a prompt
@@ -592,7 +603,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_MIN_LINES`         | `350`                     | Block threshold                                                    |
 | `CTX_MODEL`             | `gemini-3.8-flash-medium` | Worker model (`agy models` lists them)                             |
 | `CTX_TIMEOUT_SECONDS`   | `300`                     | Cap per call                                                       |
-| `CTX_MAX_PAYLOAD_BYTES` | `2000000`                 | Payload cap                                                        |
+| `CTX_MAX_PAYLOAD_BYTES` | `190000`                  | What the worker is sent at most (`agy` cuts at 192,000 bytes)      |
 | `CTX_DISABLE`           | —                         | `1` disarms **every** hook                                         |
 | `CTX_STATE`             | `~/.local/state/ctx`      | Where the ledgers, window readings and worker home live            |
 | `CTX_WORKER_HOME`       | `$CTX_STATE/worker-home`  | The worker's own home, holding its `agy` login                     |

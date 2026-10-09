@@ -1695,6 +1695,65 @@ has "  the reason ends with ekko's sentence" present 'allow set to "abc123"' "$(
 out=$(ek "" guard-secrets "$(sec_bash 'cat .env')")
 has "cat .env, ekko cannot tell: no sentence" absent "allow set to" "$(why "$out")"
 
+# --- worker transport (lib/transport.sh) --------------------------------------------
+# agy cuts a message at 192,000 bytes, and the end is where bulk-read's question
+# is. A call that would pass the cap is refused before the worker runs, and a
+# reply that does not start with the mark ending the message is an error. Here
+# a fake bwrap runs a fake agy, which cuts what it is sent at FAKE_CUT bytes, as
+# the real one does at 192,000, and starts its reply with the mark it saw, or
+# MISSING.
+echo "worker transport:"
+WB="$TMP/workerbin"
+mkdir -p "$WB" "$TMP/worker-home/.gemini"
+cat >"$WB/bwrap" <<FAKE
+#!$(command -v bash)
+while [ \$# -gt 0 ] && [ "\${1##*/}" != agy ]; do shift; done
+exec "\$@"
+FAKE
+cat >"$WB/agy" <<FAKE
+#!$(command -v bash)
+: >>"\$FAKE_RAN"
+content=\$(jq -r '.message.content' | head -c "\${FAKE_CUT:-100000000}")
+mark=\$(printf '%s\n' "\$content" | sed -n 's/^END-OF-MESSAGE //p' | tail -n 1)
+question=\$(printf '%s\n' "\$content" | grep -m 1 '^Question: ' || echo 'no question')
+jq -nc --arg r "\${mark:-MISSING}
+answer to: \$question" '{event: "result", result: {status: "SUCCESS", response: \$r, usage: {input_tokens: 1000}}}'
+FAKE
+chmod +x "$WB/bwrap" "$WB/agy"
+# worker <env...> <bin/ script> <args...> -- stdout, then the exit code; stderr to $TMP/werr
+worker() {
+  local envs=() script
+  while [[ ${1:-} == *=* ]]; do
+    envs+=("$1")
+    shift
+  done
+  script=$1
+  shift
+  env PATH="$WB:$PATH" CTX_WORKER_HOME="$TMP/worker-home" FAKE_RAN="$TMP/ran" "${envs[@]}" "$ROOT/bin/$script" "$@" 2>"$TMP/werr"
+  echo "rc=$?"
+}
+out=$(worker bulk-read --question "what is on line 7?" --paths "$TMP/small.ts")
+has "a whole message: answered" present "answer to: Question: what is on line 7?" "$out"
+has "...without the mark" absent "ctx-end-" "$out"
+has "...rc 0" present "rc=0" "$out"
+has "...the ledger says the end was seen" present '"end_seen":true' "$(tail -n 1 "$CTX_LEDGER")"
+out=$(worker FAKE_CUT=300 bulk-read --question "what is on line 7?" --paths "$TMP/small.ts")
+has "cut before the end: an error" present "rc=1" "$out"
+has "...nothing answered" absent "answer to" "$out"
+has "...saying the worker did not see the end" present "did not see the end" "$(cat "$TMP/werr")"
+has "...and the ledger" present '"end_seen":false' "$(tail -n 1 "$CTX_LEDGER")"
+rm -f "$TMP/ran"
+head -c 200000 /dev/zero | tr '\0' x | fold -w 100 >"$TMP/200k.txt"
+out=$(worker bulk-read --question "q" --paths "$TMP/200k.txt")
+has "a 200 KB payload: refused" present "rc=1" "$out"
+has "...before the worker runs" absent "ran" "$([ -e "$TMP/ran" ] && echo ran)"
+has "...saying to split it" present "Split it" "$(cat "$TMP/werr")"
+out=$(worker CTX_MAX_PAYLOAD_BYTES=300000 bulk-read --question "q" --paths "$TMP/200k.txt")
+has "...under a raised cap: sent" present "rc=0" "$out"
+out=$(worker code-write --spec "lines 41 to 43" --reference "$TMP/small.ts" --target "$TMP/gen-w.ts")
+has "code-write: the target written" present "answer to" "$(cat "$TMP/gen-w.ts" 2>/dev/null)"
+has "...without the mark" absent "ctx-end-" "$(cat "$TMP/gen-w.ts" 2>/dev/null)"
+
 # --- live: the worker ---------------------------------------------------------------
 # Not hermetic (needs the worker signed in via ctx-login, and the network), so
 # it is opt-in. The wall checks run commands inside the sandbox directly instead
@@ -1705,6 +1764,8 @@ if [ "$LIVE" -eq 1 ]; then
   export CTX_WORKER_HOME="$REAL_WORKER_HOME"
   # shellcheck source=lib/transport.sh
   . "$ROOT/lib/transport.sh"
+  # Sourcing it set its own EXIT trap over the suite's, which left $TMP behind.
+  trap 'rm -rf "$TMP" "${CTX_TMPFILES[@]}"' EXIT
   if ! ctx_preflight; then
     fail=$((fail + 1))
     echo "  FAIL  live checks need the worker signed in: run ctx-login"
@@ -1737,6 +1798,13 @@ if [ "$LIVE" -eq 1 ]; then
     echo "live — one real delegation each:"
     ans=$("$ROOT/bin/bulk-read" --question "What is the exact text on line 7? Reply with that text only." --paths "$TMP/small.ts" 2>"$TMP/err")
     has "bulk-read answers from the file" present "line 7" "$ans"
+    [ -n "$ans" ] || sed 's/^/        /' "$TMP/err"
+    # The cap against the installed agy's cut (192,000 bytes on 1.2.16): a
+    # message just under the cap reaches the worker whole, end mark included.
+    { seq 1 40000 | sed 's/^/line /' | head -c $((CTX_MAX_PAYLOAD_BYTES - 1500)); } >"$TMP/edge.msg"
+    printf '\nQuestion: reply with the word ARRIVED and nothing else.\n' >>"$TMP/edge.msg"
+    ans=$(ctx_invoke edge "Answer the question at the end of the message." "$TMP/edge.msg" 2>"$TMP/err")
+    has "a message just under the cap arrives whole" present "ARRIVED" "$ans"
     [ -n "$ans" ] || sed 's/^/        /' "$TMP/err"
     "$ROOT/bin/code-write" --spec "Same format, lines 41 to 45 only." --reference "$TMP/small.ts" --target "$TMP/gen.ts" 2>"$TMP/err"
     has "code-write writes the target" present "line 4" "$(cat "$TMP/gen.ts" 2>/dev/null)"

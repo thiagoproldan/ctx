@@ -41,8 +41,15 @@
 CTX_STATE="${CTX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ctx}"
 CTX_MODEL="${CTX_MODEL:-gemini-3.8-flash-medium}"
 CTX_TIMEOUT_SECONDS="${CTX_TIMEOUT_SECONDS:-300}"
-# Gemini Flash has a 1M-token window; ~4 bytes/token leaves ample headroom.
-CTX_MAX_PAYLOAD_BYTES="${CTX_MAX_PAYLOAD_BYTES:-2000000}"
+# The model has a 1M-token window, but agy cuts a message at 192,000 bytes,
+# whatever they hold: measured 2026-10-09 on agy 1.2.16 with numbered lines of
+# code (~2.1 bytes a token), of hex (~1) and of accented text (148,279
+# characters), each cut within a line of byte 192,000 -- 48,000 tokens at the
+# 4 bytes a token agy's ByteApproximationTokenCounter counts. Past it the end
+# of the message never arrives, and the end is where bulk-read's question is:
+# 5 of 5 calls past ~190 KB on 2026-10-07 answered without it. So the cap is
+# on what agy is sent, instructions included, under that edge.
+CTX_MAX_PAYLOAD_BYTES="${CTX_MAX_PAYLOAD_BYTES:-190000}"
 CTX_LEDGER="${CTX_LEDGER:-$CTX_STATE/usage.jsonl}"
 CTX_WORKER_HOME="${CTX_WORKER_HOME:-$CTX_STATE/worker-home}"
 
@@ -121,26 +128,40 @@ ctx_sandbox() {
 # agy has no system-prompt flag, so the instructions travel at the top of the
 # user turn. That also carries the "no tools" rule — a request, not a
 # guarantee; the guarantee is the sandbox.
+#
+# The message ends with a mark the worker cannot guess, and the reply must
+# start with it: a worker that never saw the end -- cut by agy, wherever its
+# edge moves -- cannot. On 2026-10-09 the reply started with the mark in 9 of
+# 9 whole messages (5-108 KB: seven probes, a bulk-read, a code-write), and
+# not in a bulk-read of 290 KB, cut; three probes cut at 192 KB said they saw
+# no end. Counting the worker's input tokens could not tell: a cut that drops
+# only the last line, the question, moves them by less than the content does.
 ctx_invoke() {
   local label="$1" instructions="$2" message_file="$3"
-  local bytes event_file out_file err_file result rc text started
+  local bytes sent content_file event_file out_file err_file result rc text started mark seen
 
-  bytes=$(wc -c <"$message_file" | tr -d ' ')
-  if [ "$bytes" -gt "$CTX_MAX_PAYLOAD_BYTES" ]; then
-    echo "Error: payload of $bytes bytes exceeds the $CTX_MAX_PAYLOAD_BYTES cap." >&2
-    echo "Send fewer files, or raise CTX_MAX_PAYLOAD_BYTES if it fits the worker's context." >&2
-    return 1
-  fi
-
+  ctx_tmpfile content_file || return 1
   ctx_tmpfile event_file || return 1
   ctx_tmpfile out_file || return 1
   ctx_tmpfile err_file || return 1
 
+  mark="ctx-end-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
   {
-    printf '<instructions>\n%s\n</instructions>\n\n' "$instructions"
+    printf '<instructions>\n%s\n%s\n</instructions>\n\n' "$instructions" \
+      'The message ends with a line "END-OF-MESSAGE <mark>". Start your reply with that mark alone on its first line, then the rest; if the message has no such line, start with MISSING alone on the first line.'
     cat "$message_file"
-  } |
-    jq -Rsc '{event: "user", message: {role: "user", content: .}}' >"$event_file"
+    printf '\nEND-OF-MESSAGE %s\n' "$mark"
+  } >"$content_file"
+
+  bytes=$(wc -c <"$message_file" | tr -d ' ')
+  sent=$(wc -c <"$content_file" | tr -d ' ')
+  if [ "$sent" -gt "$CTX_MAX_PAYLOAD_BYTES" ]; then
+    echo "Error: $label would send the worker $sent bytes, past the $CTX_MAX_PAYLOAD_BYTES cap: agy cuts a message at 192,000 bytes, and its end, where the question is, would never arrive." >&2
+    echo "Split it: fewer or smaller files per call, then put the answers together." >&2
+    return 1
+  fi
+
+  jq -Rsc '{event: "user", message: {role: "user", content: .}}' <"$content_file" >"$event_file"
 
   started=$(date +%s%3N)
   ctx_sandbox "$(command -v agy)" \
@@ -177,20 +198,39 @@ ctx_invoke() {
     echo "Error: $label returned no text." >&2
     return 1
   fi
+  # The mark, on the reply's first line that holds anything, is taken off.
+  seen=false
+  text=${text#"${text%%[![:space:]]*}"}
+  if [[ ${text%%$'\n'*} == *"$mark"* ]]; then
+    seen=true
+    case "$text" in
+    *$'\n'*) text=${text#*$'\n'} ;;
+    *) text="" ;;
+    esac
+  fi
 
   # Ledger: the saving is only verifiable if every delegation records its cost.
   mkdir -p "$(dirname "$CTX_LEDGER")" 2>/dev/null
   printf '%s' "$result" | jq -c \
     --arg label "$label" --arg model "$CTX_MODEL" \
-    --argjson payload_bytes "$bytes" --argjson answer_bytes "${#text}" \
-    --argjson ms "$(($(date +%s%3N) - started))" \
+    --argjson payload_bytes "$bytes" --argjson sent_bytes "$sent" --argjson end_seen "$seen" \
+    --argjson answer_bytes "${#text}" --argjson ms "$(($(date +%s%3N) - started))" \
     '{ts: now|todate, label: $label, worker: "agy", model: $model,
-      payload_bytes: $payload_bytes, answer_bytes: $answer_bytes,
+      payload_bytes: $payload_bytes, sent_bytes: $sent_bytes, end_seen: $end_seen,
+      answer_bytes: $answer_bytes,
       worker_input: (.usage.input_tokens // 0),
       worker_cache_read: (.usage.cache_read_tokens // 0),
       worker_thinking: (.usage.thinking_tokens // 0),
       worker_output: (.usage.output_tokens // 0),
       ms: $ms}' >>"$CTX_LEDGER" 2>/dev/null || true
 
+  if [ "$seen" != true ]; then
+    echo "Error: $label: the worker's reply does not start with the mark that ends its message, so it did not see the end, where the question is. agy cut it, or the worker broke the rule: split the call, or retry it once." >&2
+    return 1
+  fi
+  if [ -z "$text" ]; then
+    echo "Error: $label returned no text." >&2
+    return 1
+  fi
   printf '%s\n' "$text"
 }
