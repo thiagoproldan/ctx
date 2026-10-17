@@ -49,7 +49,8 @@ plugin, the same way ekko is.
      stand, and holds a scheduled prompt past either cap (see _The usage
      caps_).
    - `announce-graph` — `SessionStart`: if the project has a graphify index, say
-     so on turn zero.
+     so on turn zero; silent where graff maps the worktree, whose own hook
+     says so (see _Integration with graff_).
    - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
      block, for the funnel.
    - `handoff` — `Stop`: with the user away, past `CTX_HANDOFF_TOKENS` of
@@ -583,6 +584,31 @@ So the block message suggests the graph first — but only when it really exists
 If `graph.json` is older than the file being read, the message says so — it does
 not block: a stale index still serves for navigation, as long as you know.
 
+## Integration with graff
+
+[graff](https://github.com/thiagoproldan/graff) is a code map: where a name is
+defined, what reaches it and what a file defines, in a git worktree's Rust, Nix,
+Bash, Python, C and Markdown, each answer with `file:line` ranges. Its plugin
+brings its MCP server and a `SessionStart` announcement of its own. ctx adds
+what only the block can: where graff reads the denied file, the denial carries
+`graff outline`'s answer, the file's symbols and their lines, so the next call
+reads one slice with `offset`/`limit` instead of the whole file.
+`lib/graff.sh` gives that outline only when all hold, and graphify's hint
+otherwise:
+
+- `graff` is on `PATH`;
+- graff reads the file: in a git worktree, in one of its languages, with at
+  least one symbol;
+- graff answers within `CTX_GRAFF_TIMEOUT` seconds (10): a worktree's first
+  question indexes it, 0.5-2.6 s cold on ~/NixOS, graff and ekko, about 0.1 s
+  warm (2026-10-17, load average ~20). The outline is cut at 1,000 tokens:
+  past them graff leaves out nested symbols and says so.
+
+`announce-graph` stays silent where graff's own hook speaks, asking that hook
+itself with the session's input (15-41 ms on ekko, graff, ctx and ~/NixOS), so
+that a session hears of one map, not two. graphify stays the fallback until
+graff's verdict decides between them (graff's tasks 25 and 26).
+
 ## The funnel: is it being used right?
 
 Counting usage answers _"it was used"_, never _"it was used when it should have
@@ -658,6 +684,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_STATE`             | `~/.local/state/ctx`      | Where the ledgers, window readings and worker home live            |
 | `CTX_WORKER_HOME`       | `$CTX_STATE/worker-home`  | The worker's own home, holding its `agy` login                     |
 | `GRAPHIFY_OUT`          | `graphify-out`            | Read, never set here — honours graphify's own                      |
+| `CTX_GRAFF_TIMEOUT`     | `10`                      | Seconds a denial waits for graff's outline before graphify's hint  |
 | `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
 | `CTX_HANDOFF_5H`        | `85`                      | The cap on the 5-hour window: no new work past it (0 off)          |
 | `CTX_HANDOFF_7D`        | `95`                      | The cap on the 7-day window: no new work past it (0 off)           |

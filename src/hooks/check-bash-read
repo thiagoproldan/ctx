@@ -550,6 +550,21 @@ def graphify_hint(path):
         return ""
 
 
+def graff_outline(path):
+    """lib/graff.sh's outline of the file, or "" where graff does not read it."""
+    lib = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "graff.sh")
+    raw = os.environ.get("CTX_GRAFF_TIMEOUT", "")
+    # A margin over graff's own timeout, which lib/graff.sh enforces.
+    wait = (int(raw) if raw.isdigit() else 10) + 2
+    try:
+        return subprocess.run(
+            ["bash", "-c", '. "$1"; graff_outline "$2"', "_", lib, path],
+            capture_output=True, text=True, timeout=wait,
+        ).stdout.rstrip("\n")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def main():
     if os.environ.get("CTX_DISABLE") == "1":
         allow()
@@ -584,11 +599,14 @@ def main():
 
     listing = "\n".join(f"  {p} ({n} lines)" for p, n in biggest)
     paths = " ".join(p for p, _ in biggest)
+    # graff's outline of the biggest file where graff reads it; graphify's hint
+    # where it does not.
+    hint = (graff_outline(top) or graphify_hint(top)) if top else ""
     reason = (
         f"This command would put ~{total} lines into your context (threshold: {min_lines}), "
         f"counted across the whole command line — loops, `cd` and multiple files included.\n"
         f"{listing}"
-        f"{graphify_hint(top) if top else ''}\n\n"
+        f"{hint}\n\n"
         f"To ingest the content anyway, delegate instead:\n"
         f"  ctx-bulk-read --question \"<question>\" --paths {paths}\n"
         f"For a specific slice, use grep, sed -n 'A,Bp' or head/tail with N under {min_lines}, "

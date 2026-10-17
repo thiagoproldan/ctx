@@ -10,11 +10,18 @@
 
 [ "${CTX_DISABLE:-0}" = "1" ] && exit 0
 
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/graphify.sh"
+LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib"
+. "$LIB/graff.sh"
+. "$LIB/graphify.sh"
 
 input=$(cat)
 cwd=$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)
 [ -z "$cwd" ] && cwd="$PWD"
+
+# graff first: where it maps this worktree, its plugin's own SessionStart hook
+# announces it, and one map announced is enough. graphify's announcement stays
+# for where graff is absent or reads no code.
+printf '%s' "$input" | graff_announces && exit 0
 
 command -v graphify >/dev/null 2>&1 || exit 0
 

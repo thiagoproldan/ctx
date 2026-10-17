@@ -230,6 +230,11 @@ FAKEBIN="$TMP/bin"
 mkdir -p "$FAKEBIN"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$FAKEBIN/graphify"
 chmod +x "$FAKEBIN/graphify"
+# And a graff that reads nothing: first on PATH, it keeps the machine's own
+# graff, where installed, out of the graphify cases. The graff cases below put
+# one that answers ahead of it.
+printf '#!/usr/bin/env bash\nexit 1\n' >"$FAKEBIN/graff"
+chmod +x "$FAKEBIN/graff"
 
 # Controlled PATH for the "no graphify" case: prepending an empty directory stops
 # working once the real graphify is on the machine's PATH — the test would
@@ -272,6 +277,66 @@ out=$(printf '%s' "$(bash_json "cd $PROJ/src/deep/deeper && cat big.ts")" |
   jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
 has "bash denial carries the graph hint too" present "$PROJ/graphify-out/graph.json" "$out"
 
+# --- graff outline ----------------------------------------------------------------
+# Where graff reads the denied file, the denial carries its outline, so that the
+# next call reads one slice with offset and limit; graphify's hint stays the
+# fallback. A fake graff, first on PATH, writes its arguments (and a hook's
+# stdin) to GRAFF_FAKE_LOG and answers as GRAFF_FAKE says.
+GRAFFBIN="$TMP/graffbin"
+mkdir -p "$GRAFFBIN"
+cat >"$GRAFFBIN/graff" <<EOF
+#!$(command -v bash)
+{ printf '%s\n' "\$*"; [ "\$1" = --hook ] && cat; } >>"\${GRAFF_FAKE_LOG:-/dev/null}"
+case "\$1" in
+--hook)
+  [ "\${GRAFF_FAKE:-}" = silent ] ||
+    echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[graff] graff maps the code of this worktree"}}'
+  ;;
+outline)
+  case "\${GRAFF_FAKE:-}" in
+  unread) echo 'graff: big.ts is no file graff reads' >&2; exit 1 ;;
+  empty) printf 'outline big.ts in /w\nbig.ts: 600 lines, 0 symbols\n' ;;
+  hang) exec sleep 30 ;;
+  *) printf 'outline big.ts in /w\nbig.ts: 600 lines, 2 symbols\n  1-300 function first_half\n  301-600 function second_half\n' ;;
+  esac
+  ;;
+esac
+EOF
+chmod +x "$GRAFFBIN/graff"
+BIG="$PROJ/src/deep/deeper/big.ts"
+GLOG="$TMP/graff-outline.log"
+
+echo "graff outline:"
+out=$(GRAFF_FAKE_LOG="$GLOG" reason "$GRAFFBIN:$FAKEBIN" "$BIG")
+has "graff reads the file: its outline in the denial" present "301-600 function second_half" "$out"
+has "graff's outline in place of graphify's hint" absent "graphify query" "$out"
+has "bulk-read still offered beside the outline" present "ctx-bulk-read" "$out"
+has "graff asked from the denied file's folder" present "outline -C $PROJ/src/deep/deeper --budget 1000 $BIG" "$(cat "$GLOG")"
+has "graff not on PATH: no outline" absent "graff's outline" "$(reason "PURE" "$BIG")"
+has "graff reads no such file: graphify's hint" present "graphify query" "$(GRAFF_FAKE=unread reason "$GRAFFBIN:$FAKEBIN" "$BIG")"
+has "no symbol in the file: graphify's hint" present "graphify query" "$(GRAFF_FAKE=empty reason "$GRAFFBIN:$FAKEBIN" "$BIG")"
+has "no symbol and no graph: no outline either" absent "graff's outline" "$(GRAFF_FAKE=empty reason "$GRAFFBIN:$FAKEBIN" "$TMP/no-index/src/big.ts")"
+# A graff that never answers must not hold the denial: lib/graff.sh's timeout,
+# set to 1 s here, gives the fallback instead.
+start=$(date +%s)
+out=$(GRAFF_FAKE=hang CTX_GRAFF_TIMEOUT=1 reason "$GRAFFBIN:$FAKEBIN" "$BIG")
+has "graff past its timeout: still denied" present "File has" "$out"
+has "graff past its timeout: graphify's hint" present "graphify query" "$out"
+eq "graff past its timeout: denied within 5 s" yes "$([ $(($(date +%s) - start)) -lt 5 ] && echo yes || echo no)"
+
+# The Bash hook asks lib/graff.sh too, for the biggest file it counted.
+bash_reason() {
+  printf '%s' "$(bash_json "cd $PROJ/src/deep/deeper && cat big.ts")" |
+    env PATH="$GRAFFBIN:$FAKEBIN:$PATH" CTX_MIN_LINES=500 "$HOOKS/check-bash-read" |
+    jq -r '.hookSpecificOutput.permissionDecisionReason // ""'
+}
+has "bash denial carries graff's outline too" present "301-600 function second_half" "$(bash_reason)"
+has "bash denial: graff reads no such file, graphify's hint" present "graphify query" "$(GRAFF_FAKE=unread bash_reason)"
+start=$(date +%s)
+out=$(GRAFF_FAKE=hang CTX_GRAFF_TIMEOUT=1 bash_reason)
+has "bash denial: graff past its timeout, graphify's hint" present "graphify query" "$out"
+eq "bash denial: graff past its timeout, within 5 s" yes "$([ $(($(date +%s) - start)) -lt 5 ] && echo yes || echo no)"
+
 # --- session announcement ---------------------------------------------------------
 # This hook injects context into EVERY session. Each silence case below is a
 # token it does not spend where it does not apply.
@@ -289,6 +354,13 @@ has "no binary on PATH, silence" absent "graphify" "$(ann "$PROJ/src" "PURE")"
 out=$(jq -nc --arg c "$PROJ/src" '{hook_event_name:"SessionStart",cwd:$c}' |
   CTX_DISABLE=1 PATH="$FAKEBIN:$PATH" "$HOOKS/announce-graph" 2>&1)
 has "CTX_DISABLE disarms" absent "graphify" "$out"
+# Where graff maps the worktree, graff's own hook announces it, and this one
+# stays silent; where graff reads no code, graphify is announced again.
+GLOG="$TMP/graff-hook.log"
+: >"$GLOG"
+has "graff maps the worktree: graphify not announced" absent "graphify" "$(GRAFF_FAKE_LOG="$GLOG" ann "$PROJ/src" "$GRAFFBIN:$FAKEBIN")"
+has "graff's hook asked with the session's own input" present "\"cwd\":\"$PROJ/src\"" "$(cat "$GLOG")"
+has "graff reads no code here: graphify announced" present "graphify query" "$(GRAFF_FAKE=silent ann "$PROJ/src" "$GRAFFBIN:$FAKEBIN")"
 
 # Folder of repos: Claude opened one level ABOVE the projects. Climbing finds
 # nothing here, and without the downward search the announcement would be mute
