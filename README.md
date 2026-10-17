@@ -48,11 +48,8 @@ plugin, the same way ekko is.
      tool: tells the model where the account's 5-hour and 7-day windows
      stand, and holds a scheduled prompt past either cap (see _The usage
      caps_).
-   - `announce-graph` — `SessionStart`: if the project has a graphify index, say
-     so on turn zero; silent where graff maps the worktree, whose own hook
-     says so (see _Integration with graff_).
-   - `track-usage` — `PostToolUse` on `Bash|Read`: records what happened after a
-     block, for the funnel.
+   - `track-usage` — `PostToolUse` on `Bash`, `Read` and graff's tools: records
+     what happened after a block, for the funnel.
    - `handoff` — `Stop`: with the user away, past `CTX_HANDOFF_TOKENS` of
      context (250k), keeps the turn open once and asks for the ekko handoff,
      then has `bin/auto-reset` type the `/clear` and `continuando` into the
@@ -566,24 +563,6 @@ Gemini token, and the network the model API needs.
 | Worker sandbox                                                                               | See above.                                                                                                                                                                                                                                                                                                                       |
 | Ledger + funnel + session metrics (`ctx-report`)                                           | The article's 90% is theirs. This measures yours.                                                                                                                                                                                                                                                                                |
 
-## Integration with graphify
-
-The two cut tokens in different halves: graphify cuts the cost of **finding**
-(querying an AST graph instead of opening five files), ctx cuts the cost of
-**ingesting** a big file you already know. A structural question delegated to a
-cheap model pays for a worse answer than the graph gives for free.
-
-So the block message suggests the graph first — but only when it really exists.
-`lib/graphify.sh` speaks only when **both** hold:
-
-- `graphify` is on `PATH` (suggesting a missing command is worse than nothing);
-- `<root>/graphify-out/graph.json` exists, searched climbing at most 12 levels
-  from the file (honours `GRAPHIFY_OUT`, relative name or absolute path, as
-  `graphify/paths.py` does).
-
-If `graph.json` is older than the file being read, the message says so — it does
-not block: a stale index still serves for navigation, as long as you know.
-
 ## Integration with graff
 
 [graff](https://github.com/thiagoproldan/graff) is a code map: where a name is
@@ -593,8 +572,7 @@ brings its MCP server and a `SessionStart` announcement of its own. ctx adds
 what only the block can: where graff reads the denied file, the denial carries
 `graff outline`'s answer, the file's symbols and their lines, so the next call
 reads one slice with `offset`/`limit` instead of the whole file.
-`lib/graff.sh` gives that outline only when all hold, and graphify's hint
-otherwise:
+`lib/graff.sh` gives that outline only when all hold, and nothing otherwise:
 
 - `graff` is on `PATH`;
 - graff reads the file: in a git worktree, in one of its languages, with at
@@ -604,10 +582,12 @@ otherwise:
   warm (2026-10-17, load average ~20). The outline is cut at 1,000 tokens:
   past them graff leaves out nested symbols and says so.
 
-`announce-graph` stays silent where graff's own hook speaks, asking that hook
-itself with the session's input (15-41 ms on ekko, graff, ctx and ~/NixOS), so
-that a session hears of one map, not two. graphify stays the fallback until
-graff's verdict decides between them (graff's tasks 25 and 26).
+The two cut tokens in different halves: graff cuts the cost of **finding**
+(asking a map instead of opening five files), ctx cuts the cost of
+**ingesting** a big file you already know. graff replaced graphify here once
+graff's verdict passed (graff's tasks 25 and 26): a session hears of graff from
+its own plugin, and a call to graff's tools, or a `graff` question from the
+shell, is the funnel's graph event.
 
 ## The funnel: is it being used right?
 
@@ -616,7 +596,7 @@ been"_. The funnel does: each block has exactly four outcomes, and only one is b
 
 | Outcome                     | Reading                                           |
 | --------------------------- | ------------------------------------------------- |
-| queried the graph           | great                                             |
+| asked graff                 | great                                             |
 | re-read with `offset/limit` | great — it was an edit                            |
 | called `ctx-bulk-read`    | fine                                              |
 | **nothing**                 | the hook was ignored and the information was lost |
@@ -683,8 +663,7 @@ the list from the binary's own `--help`, plus the hidden `rc`/`remote-control`.
 | `CTX_DISABLE`           | —                         | `1` disarms **every** hook                                         |
 | `CTX_STATE`             | `~/.local/state/ctx`      | Where the ledgers, window readings and worker home live            |
 | `CTX_WORKER_HOME`       | `$CTX_STATE/worker-home`  | The worker's own home, holding its `agy` login                     |
-| `GRAPHIFY_OUT`          | `graphify-out`            | Read, never set here — honours graphify's own                      |
-| `CTX_GRAFF_TIMEOUT`     | `10`                      | Seconds a denial waits for graff's outline before graphify's hint  |
+| `CTX_GRAFF_TIMEOUT`     | `10`                      | Seconds a denial waits for graff's outline before going without   |
 | `CTX_HANDOFF_TOKENS`    | `250000`                  | Status line and Stop hook: context that warrants a handoff (0 off) |
 | `CTX_HANDOFF_5H`        | `85`                      | The cap on the 5-hour window: no new work past it (0 off)          |
 | `CTX_HANDOFF_7D`        | `95`                      | The cap on the 7-day window: no new work past it (0 off)           |
@@ -709,21 +688,6 @@ The worker is cheap, not good. Its answer is an **unverified** summary: check on
 disk (`sed -n 'N,Mp'`) any exact line or value before using it in an edit, and
 run the tests of whatever `ctx-code-write` generates. The gain is in not
 loading 80k tokens of file for a 900-token question — not in trusting the answer.
-
-## graphify on NixOS
-
-The NixOS module also installs graphify from nixpkgs and its Claude skill from the
-package (`skill.md` plus `skills/claude/references`), in place of
-`graphify install`, and ignores `graphify-out/` globally in git. Two details
-found by measuring:
-
-- **`--code-only` is the default you want.** Without it, `graphify .` aborts when
-  the corpus has docs/PDFs/images: those need an LLM API key, and a subscription
-  login is not one. The **code** graph is local and free anyway:
-  `graphify . --code-only --no-viz`.
-- **`.glsl` is not indexed** — GLSL shaders are invisible to the graph and need
-  reading. `.swift`, `.metal`, `.m` and `.mm` are (the last three through the C
-  parser).
 
 ## License
 

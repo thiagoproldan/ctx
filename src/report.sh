@@ -86,12 +86,12 @@ if [ -n "$funnel" ]; then
     | ([ $o[] | (.lines | tonumber? // 0) ]) as $l
     | ($c.nothing // 0) as $nothing
     | "blocks: \($o | length)  (\($bytool))",
-      "  -> graph queried     : \($c.graph  // 0)",
+      "  -> graff asked       : \($c.graph  // 0)",
       "  -> targeted re-read  : \($c.reread // 0)",
       "  -> bulk-read         : \($c.bulk   // 0)",
       "  -> NOTHING (ignored) : \($nothing)\(if $nothing > 0 then "   <- look here" else "" end)",
       "",
-      "graph queries: \($nq)  (deterministic, free)",
+      "graff questions: \($nq)  (deterministic, free)",
       (if ($l | length) > 0 and ($l | add) > 0
        then "lines kept out: \($l | add) in total, largest \($l | max)"
        else empty end)

@@ -36,17 +36,16 @@ esac
 lines=$(wc -l < "$file_path" 2>/dev/null | tr -d ' ' || echo 0)
 [ "$lines" -le "$MIN_LINES" ] && allow
 
-# Only from here on is it worth looking for an index and logging: an allowed
-# read pays for none of this.
+# Only from here on is it worth asking graff and logging: an allowed read pays
+# for none of this.
 LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib"
 . "$LIB/graff.sh"
-. "$LIB/graphify.sh"
 . "$LIB/ledger.sh"
 ctx_log block "$(printf '%s' "$input" | jq -r '.session_id // "?"')" \
   path "$file_path" lines "$lines" tool Read
 
-# graff's outline where graff reads the file; graphify's hint where it does not.
-hint=$(graff_outline "$file_path") || hint=$(graphify_hint "$file_path")
+# graff's outline where graff reads the file; nothing more where it does not.
+hint=$(graff_outline "$file_path") || hint=""
 
 deny "File has ${lines} lines (threshold: ${MIN_LINES}).${hint}
 

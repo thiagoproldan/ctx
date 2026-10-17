@@ -177,10 +177,11 @@ for h in check-file-size check-bash-read; do
   fi
 done
 
-# --- graphify hint --------------------------------------------------------------
-# The detector is only worth having if it knows how to stay quiet. Each case
-# below exists because the wrong silence (suggesting a missing command, pointing
-# at another project's index) hurts more than no suggestion.
+# --- graff outline ----------------------------------------------------------------
+# Where graff reads the denied file, the denial carries its outline, so that the
+# next call reads one slice with offset and limit. The outline is only worth
+# having if it knows how to stay quiet: each silence case below exists because a
+# wrong hint (a missing command, a hang) hurts more than none.
 
 # reason <extra-PATH> <file> — the check-file-size denial text
 reason() {
@@ -219,79 +220,27 @@ eq() {
 }
 
 PROJ="$TMP/proj"
-mkdir -p "$PROJ/graphify-out" "$PROJ/src/deep/deeper" "$TMP/no-index/src"
+mkdir -p "$PROJ/src/deep/deeper"
 cp "$TMP/big.ts" "$PROJ/src/deep/deeper/big.ts"
-cp "$TMP/big.ts" "$TMP/no-index/src/big.ts"
-echo '{"nodes":[]}' >"$PROJ/graphify-out/graph.json"
+BIG="$PROJ/src/deep/deeper/big.ts"
 
-# A fake `graphify`, for PATH only. Without it the detector must stay quiet even
-# with an index present.
-FAKEBIN="$TMP/bin"
-mkdir -p "$FAKEBIN"
-printf '#!/usr/bin/env bash\nexit 0\n' >"$FAKEBIN/graphify"
-chmod +x "$FAKEBIN/graphify"
-# And a graff that reads nothing: first on PATH, it keeps the machine's own
-# graff, where installed, out of the graphify cases. The graff cases below put
-# one that answers ahead of it.
-printf '#!/usr/bin/env bash\nexit 1\n' >"$FAKEBIN/graff"
-chmod +x "$FAKEBIN/graff"
-
-# Controlled PATH for the "no graphify" case: prepending an empty directory stops
-# working once the real graphify is on the machine's PATH — the test would
-# measure the machine, not the hook. PUREBIN has everything the hooks use except
-# graphify.
+# Controlled PATH for the "no graff" case: prepending an empty directory stops
+# working once the real graff is on the machine's PATH — the test would measure
+# the machine, not the hook. PUREBIN has everything the hooks use except graff.
 PUREBIN="$TMP/purebin"
 mkdir -p "$PUREBIN"
 for c in jq find sed grep wc dirname basename sort head tr cat cut mktemp touch env bash python3 shfmt; do
   p=$(command -v "$c" 2>/dev/null) && ln -sf "$p" "$PUREBIN/$c"
 done
-command -v graphify >/dev/null 2>&1 && [ -e "$PUREBIN/graphify" ] && rm -f "$PUREBIN/graphify"
 
-echo "graphify hint:"
-has "no graphify on PATH, index present" absent "graphify query" "$(reason "PURE" "$PROJ/src/deep/deeper/big.ts")"
-has "graphify present, no index" absent "graphify query" "$(reason "$FAKEBIN" "$TMP/no-index/src/big.ts")"
-has "graphify and index (3 levels up)" present "graphify query" "$(reason "$FAKEBIN" "$PROJ/src/deep/deeper/big.ts")"
-has "points at the right project's --graph" present "$PROJ/graphify-out/graph.json" "$(reason "$FAKEBIN" "$PROJ/src/deep/deeper/big.ts")"
-has "bulk-read still offered alongside" present "ctx-bulk-read" "$(reason "$FAKEBIN" "$PROJ/src/deep/deeper/big.ts")"
-
-# Freshness. Both ends are staged with touch: creation order above already made
-# the index newer, and without forcing this the "stale" case would pass by never
-# firing, not by working.
-touch -d '2020-01-01' "$PROJ/graphify-out/graph.json"
-has "stale index is flagged" present "index is older" "$(reason "$FAKEBIN" "$PROJ/src/deep/deeper/big.ts")"
-touch "$PROJ/graphify-out/graph.json"
-has "fresh index is not flagged" absent "index is older" "$(reason "$FAKEBIN" "$PROJ/src/deep/deeper/big.ts")"
-
-# GRAPHIFY_OUT: relative name and absolute path.
-mv "$PROJ/graphify-out" "$PROJ/graphify-out-feature"
-has "no override, custom name not found" absent "graphify query" "$(reason "$FAKEBIN" "$PROJ/src/deep/deeper/big.ts")"
-out=$(GRAPHIFY_OUT=graphify-out-feature reason "$FAKEBIN" "$PROJ/src/deep/deeper/big.ts")
-has "relative GRAPHIFY_OUT honoured" present "graphify-out-feature/graph.json" "$out"
-out=$(GRAPHIFY_OUT="$PROJ/graphify-out-feature" reason "$FAKEBIN" "$TMP/no-index/src/big.ts")
-has "absolute GRAPHIFY_OUT honoured" present "graphify query" "$out"
-
-# The Bash hook reuses the same hint on its denial path.
-mv "$PROJ/graphify-out-feature" "$PROJ/graphify-out"
-out=$(printf '%s' "$(bash_json "cd $PROJ/src/deep/deeper && cat big.ts")" |
-  env PATH="$FAKEBIN:$PATH" CTX_MIN_LINES=500 "$HOOKS/check-bash-read" |
-  jq -r '.hookSpecificOutput.permissionDecisionReason // ""')
-has "bash denial carries the graph hint too" present "$PROJ/graphify-out/graph.json" "$out"
-
-# --- graff outline ----------------------------------------------------------------
-# Where graff reads the denied file, the denial carries its outline, so that the
-# next call reads one slice with offset and limit; graphify's hint stays the
-# fallback. A fake graff, first on PATH, writes its arguments (and a hook's
-# stdin) to GRAFF_FAKE_LOG and answers as GRAFF_FAKE says.
+# A fake graff, first on PATH, writes its arguments to GRAFF_FAKE_LOG and
+# answers as GRAFF_FAKE says.
 GRAFFBIN="$TMP/graffbin"
 mkdir -p "$GRAFFBIN"
 cat >"$GRAFFBIN/graff" <<EOF
 #!$(command -v bash)
-{ printf '%s\n' "\$*"; [ "\$1" = --hook ] && cat; } >>"\${GRAFF_FAKE_LOG:-/dev/null}"
+printf '%s\n' "\$*" >>"\${GRAFF_FAKE_LOG:-/dev/null}"
 case "\$1" in
---hook)
-  [ "\${GRAFF_FAKE:-}" = silent ] ||
-    echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[graff] graff maps the code of this worktree"}}'
-  ;;
 outline)
   case "\${GRAFF_FAKE:-}" in
   unread) echo 'graff: big.ts is no file graff reads' >&2; exit 1 ;;
@@ -303,102 +252,60 @@ outline)
 esac
 EOF
 chmod +x "$GRAFFBIN/graff"
-BIG="$PROJ/src/deep/deeper/big.ts"
 GLOG="$TMP/graff-outline.log"
 
 echo "graff outline:"
-out=$(GRAFF_FAKE_LOG="$GLOG" reason "$GRAFFBIN:$FAKEBIN" "$BIG")
+out=$(GRAFF_FAKE_LOG="$GLOG" reason "$GRAFFBIN" "$BIG")
 has "graff reads the file: its outline in the denial" present "301-600 function second_half" "$out"
-has "graff's outline in place of graphify's hint" absent "graphify query" "$out"
 has "bulk-read still offered beside the outline" present "ctx-bulk-read" "$out"
 has "graff asked from the denied file's folder" present "outline -C $PROJ/src/deep/deeper --budget 1000 $BIG" "$(cat "$GLOG")"
-has "graff not on PATH: no outline" absent "graff's outline" "$(reason "PURE" "$BIG")"
-has "graff reads no such file: graphify's hint" present "graphify query" "$(GRAFF_FAKE=unread reason "$GRAFFBIN:$FAKEBIN" "$BIG")"
-has "no symbol in the file: graphify's hint" present "graphify query" "$(GRAFF_FAKE=empty reason "$GRAFFBIN:$FAKEBIN" "$BIG")"
-has "no symbol and no graph: no outline either" absent "graff's outline" "$(GRAFF_FAKE=empty reason "$GRAFFBIN:$FAKEBIN" "$TMP/no-index/src/big.ts")"
+out=$(reason "PURE" "$BIG")
+has "graff not on PATH: no outline" absent "graff's outline" "$out"
+has "graff not on PATH: still denied" present "File has" "$out"
+has "graff reads no such file: no outline" absent "graff's outline" "$(GRAFF_FAKE=unread reason "$GRAFFBIN" "$BIG")"
+has "no symbol in the file: no outline" absent "graff's outline" "$(GRAFF_FAKE=empty reason "$GRAFFBIN" "$BIG")"
 # A graff that never answers must not hold the denial: lib/graff.sh's timeout,
-# set to 1 s here, gives the fallback instead.
+# set to 1 s here, lets it go without the outline.
 start=$(date +%s)
-out=$(GRAFF_FAKE=hang CTX_GRAFF_TIMEOUT=1 reason "$GRAFFBIN:$FAKEBIN" "$BIG")
+out=$(GRAFF_FAKE=hang CTX_GRAFF_TIMEOUT=1 reason "$GRAFFBIN" "$BIG")
 has "graff past its timeout: still denied" present "File has" "$out"
-has "graff past its timeout: graphify's hint" present "graphify query" "$out"
+has "graff past its timeout: no outline" absent "graff's outline" "$out"
 eq "graff past its timeout: denied within 5 s" yes "$([ $(($(date +%s) - start)) -lt 5 ] && echo yes || echo no)"
 
 # The Bash hook asks lib/graff.sh too, for the biggest file it counted.
 bash_reason() {
   printf '%s' "$(bash_json "cd $PROJ/src/deep/deeper && cat big.ts")" |
-    env PATH="$GRAFFBIN:$FAKEBIN:$PATH" CTX_MIN_LINES=500 "$HOOKS/check-bash-read" |
+    env PATH="$GRAFFBIN:$PATH" CTX_MIN_LINES=500 "$HOOKS/check-bash-read" |
     jq -r '.hookSpecificOutput.permissionDecisionReason // ""'
 }
 has "bash denial carries graff's outline too" present "301-600 function second_half" "$(bash_reason)"
-has "bash denial: graff reads no such file, graphify's hint" present "graphify query" "$(GRAFF_FAKE=unread bash_reason)"
+has "bash denial: graff reads no such file, no outline" absent "graff's outline" "$(GRAFF_FAKE=unread bash_reason)"
 start=$(date +%s)
 out=$(GRAFF_FAKE=hang CTX_GRAFF_TIMEOUT=1 bash_reason)
-has "bash denial: graff past its timeout, graphify's hint" present "graphify query" "$out"
+has "bash denial: graff past its timeout, still denied" present "would put" "$out"
 eq "bash denial: graff past its timeout, within 5 s" yes "$([ $(($(date +%s) - start)) -lt 5 ] && echo yes || echo no)"
 
-# --- session announcement ---------------------------------------------------------
-# This hook injects context into EVERY session. Each silence case below is a
-# token it does not spend where it does not apply.
-ann() {
-  local p="${2:+$2:}$PATH"
-  [ "${2:-}" = "PURE" ] && p="$PUREBIN"
-  jq -nc --arg c "$1" '{hook_event_name:"SessionStart",cwd:$c,session_id:"t"}' |
-    env PATH="$p" "$HOOKS/announce-graph" 2>&1
-}
-echo "session announcement:"
-has "with graph, announces" present "graphify query" "$(ann "$PROJ/src" "$FAKEBIN")"
-has "with graph, points at the right file" present "$PROJ/graphify-out/graph.json" "$(ann "$PROJ/src" "$FAKEBIN")"
-has "no graph, silence" absent "graphify" "$(ann "$TMP/no-index/src" "$FAKEBIN")"
-has "no binary on PATH, silence" absent "graphify" "$(ann "$PROJ/src" "PURE")"
-out=$(jq -nc --arg c "$PROJ/src" '{hook_event_name:"SessionStart",cwd:$c}' |
-  CTX_DISABLE=1 PATH="$FAKEBIN:$PATH" "$HOOKS/announce-graph" 2>&1)
-has "CTX_DISABLE disarms" absent "graphify" "$out"
-# Where graff maps the worktree, graff's own hook announces it, and this one
-# stays silent; where graff reads no code, graphify is announced again.
-GLOG="$TMP/graff-hook.log"
-: >"$GLOG"
-has "graff maps the worktree: graphify not announced" absent "graphify" "$(GRAFF_FAKE_LOG="$GLOG" ann "$PROJ/src" "$GRAFFBIN:$FAKEBIN")"
-has "graff's hook asked with the session's own input" present "\"cwd\":\"$PROJ/src\"" "$(cat "$GLOG")"
-has "graff reads no code here: graphify announced" present "graphify query" "$(GRAFF_FAKE=silent ann "$PROJ/src" "$GRAFFBIN:$FAKEBIN")"
-
-# Folder of repos: Claude opened one level ABOVE the projects. Climbing finds
-# nothing here, and without the downward search the announcement would be mute
-# exactly when comparing repos.
-REPOS="$TMP/repos"
-for r in one two three; do
-  mkdir -p "$REPOS/$r/graphify-out" "$REPOS/$r/src"
-  echo '{}' >"$REPOS/$r/graphify-out/graph.json"
-done
-has "3 repos: counts all three" present "holds 3 indexed projects" "$(ann "$REPOS" "$FAKEBIN")"
-has "3 repos: teaches merge-graphs" present "merge-graphs" "$(ann "$REPOS" "$FAKEBIN")"
-has "3 repos: not the single-project text" absent "This project has a graph" "$(ann "$REPOS" "$FAKEBIN")"
-mkdir -p "$TMP/empty"
-has "empty folder: silence" absent "graphify" "$(ann "$TMP/empty" "$FAKEBIN")"
-# One more nesting level must not be reached (noise at a distance). Its own tree:
-# $TMP already has $PROJ as a DIRECT child, where announcing is right — the first
-# version of this test measured the wrong tree, not the depth limit.
-mkdir -p "$TMP/grand/mid/repo/graphify-out"
-echo '{}' >"$TMP/grand/mid/repo/graphify-out/graph.json"
-has "grandchild (2 levels) not reached" absent "graphify" "$(ann "$TMP/grand" "$FAKEBIN")"
-has "child (1 level) reached" present "graphify" "$(ann "$TMP/grand/mid" "$FAKEBIN")"
-# Inside a repo, the upward search wins, not the list.
-has "inside a repo: upward path" present "This project has a graph" "$(ann "$REPOS/one/src" "$FAKEBIN")"
 
 # --- funnel -----------------------------------------------------------------------
-# track-usage runs on every Bash and Read. Half the cases here exist to prove it
-# does NOT record — noise in the funnel corrupts the whole report.
+# track-usage runs on every Bash and Read, and on graff's tools. Half the cases
+# here exist to prove it does NOT record — noise in the funnel corrupts the
+# whole report.
 echo "track-usage (PostToolUse) and block logging:"
 FUN="$TMP/funnel.jsonl"
 : >"$FUN"
 trk() { printf '%s' "$1" | env CTX_FUNNEL="$FUN" "$HOOKS/track-usage" >/dev/null 2>&1; }
 evs() { jq -r '.ev' "$FUN" 2>/dev/null | tr '\n' ' '; }
 
-trk "$(jq -nc '{session_id:"s",tool_name:"Bash",tool_input:{command:"graphify query \"x\" --graph /g.json"}}')"
-has "graphify query becomes a graph event" present "graph" "$(evs)"
+trk "$(jq -nc '{session_id:"s",tool_name:"mcp__plugin_graff_graff__callers",tool_input:{symbol:"load"}}')"
+has "a call to graff's tools becomes a graph event" present "graph" "$(evs)"
+has "the graph event names the tool" present '"tool":"callers"' "$(cat "$FUN")"
+trk "$(jq -nc '{session_id:"s",tool_name:"Bash",tool_input:{command:"cd /p && graff def load"}}')"
+has "graff def from the shell is a graph event too" present "graph graph" "$(evs)"
 trk "$(jq -nc '{session_id:"s",tool_name:"Bash",tool_input:{command:"ls -la /tmp"}}')"
 trk "$(jq -nc '{session_id:"s",tool_name:"Read",tool_input:{file_path:"/p/x.rs"}}')"
-has "ls and whole Read record nothing" absent "graph graph" "$(evs)"
+# graff's own repository puts its name in every path: a path is no question.
+trk "$(jq -nc '{session_id:"s",tool_name:"Bash",tool_input:{command:"ls /projects/graff/src"},cwd:"/projects/graff"}')"
+has "ls, whole Read and graff's paths record nothing" absent "graph graph graph" "$(evs)"
 trk "$(jq -nc '{session_id:"s",tool_name:"Read",tool_input:{file_path:"/p/b.rs",offset:10,limit:5}}')"
 has "targeted Read becomes reread" present "reread" "$(evs)"
 has "reread keeps the right path" present '"path":"/p/b.rs"' "$(cat "$FUN")"

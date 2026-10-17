@@ -36,7 +36,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Read",
+        "matcher": "Bash|Read|mcp__plugin_graff_graff__.*",
         "hooks": [{ "type": "command", "command": "@root@/hooks/track-usage" }]
       },
       {
@@ -53,7 +53,6 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "@root@/hooks/announce-graph" },
           { "type": "command", "command": "@root@/hooks/window start" },
           { "type": "command", "command": "@root@/hooks/cleared start" }
         ]

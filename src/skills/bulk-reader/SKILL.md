@@ -1,22 +1,19 @@
 ---
 name: bulk-reader
-description: Delegates file reading to a cheap non-Claude model (Gemini, via agy) instead of pulling the content into context. Use when reading files over ~350 lines, answering a question that spans 3+ files, or summarising big diffs and logs. If the project has a graphify index, query the graph first.
+description: Delegates file reading to a cheap non-Claude model (Gemini, via agy) instead of pulling the content into context. Use when reading files over ~350 lines, answering a question that spans 3+ files, or summarising big diffs and logs. Where graff maps the code, ask its tools first.
 ---
 
-**Before delegating, check whether it is a graph question.** If the project has
-`graphify-out/graph.json` (and `graphify` on PATH), a structural question — _who
-calls X, what this module exposes, how A and B connect_ — is answered from the
-AST, free per query and with no risk of an invented summary:
+**Before delegating, check whether it is a question about the code's
+structure.** Where graff maps the worktree (its plugin says so when the session
+starts), a structural question — _where X is defined, who calls it, what this
+file defines, what a change would touch_ — is answered by its tools
+(`mcp__plugin_graff_graff__def`, `callers`, `callees`, `outline`, `impact`,
+`search`, `map`) from the code itself, within a token budget and with no risk
+of an invented summary. A denied big read already carries the file's outline:
+read the slice you need with offset and limit.
 
-```bash
-graphify query "<question>"  --graph <root>/graphify-out/graph.json
-graphify explain "<symbol>"  --graph <root>/graphify-out/graph.json
-graphify path "<A>" "<B>"    --graph <root>/graphify-out/graph.json
-```
-
-The blocking hooks already detect the index and build these commands with the
-right path when it exists. `ctx-bulk-read` is for what no graph indexes — logs,
-dumps, generated files, huge diffs — and for when there is no index:
+`ctx-bulk-read` is for what no map answers — logs, dumps, generated files, huge
+diffs, prose — and for code in a language graff does not read:
 
 ```bash
 ctx-bulk-read --question "<question>" --paths <file1> [<file2> ...]

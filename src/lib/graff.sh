@@ -1,16 +1,15 @@
-# graff detection, so the hooks can point at graff's map before graphify's.
+# graff detection, so a denied read can carry the file's outline.
 #
 # graff (github.com/thiagoproldan/graff) maps a git worktree's Rust, Nix, Bash,
 # Python, C and Markdown: where a name is defined, what reaches it, what a file
 # defines, each answer with file:line ranges. Its plugin brings its own MCP
 # server and SessionStart announcement; what ctx adds is the outline on a denied
 # read, so the next call reads one slice with offset and limit instead of the
-# whole file. graphify (lib/graphify.sh) stays the fallback wherever graff is
-# absent or reads no code, until graff's verdict decides between them (graff's
-# task 26).
+# whole file. It replaced graphify here when graff's verdict passed (graff's
+# tasks 25 and 26).
 #
-# Cost: graff_outline runs only on the hooks' DENY path, graff_announces only
-# at SessionStart. An allowed read pays nothing for this.
+# Cost: graff_outline runs only on the hooks' DENY path. An allowed read pays
+# nothing for this.
 
 # graff_outline <file>
 # Echoes the denial's block with the file's outline: its symbols and their line
@@ -33,18 +32,8 @@ graff_outline() {
   case "$out" in *", 0 symbols"*) return 1 ;; esac
 
   # Two leading blank lines: command substitution eats the trailing one, so
-  # without them the block glues onto the text above (as graphify_hint).
+  # without them the block glues onto the text above.
   printf '%s\n' "" "" \
     "graff's outline of this file, its symbols and their lines: read the slice you need with offset and limit." \
     "$out"
-}
-
-# graff_announces
-# Succeeds when graff's own SessionStart hook speaks for the session whose hook
-# input is on stdin: graff on PATH, and code it reads in the worktree. It asks
-# graff's hook itself, with the same input and CLAUDE_PROJECT_DIR, so the two
-# never disagree on what graff maps: 15-41 ms on ekko, graff, ctx and ~/NixOS.
-graff_announces() {
-  command -v graff >/dev/null 2>&1 || return 1
-  [ -n "$(timeout 5 graff --hook 2>/dev/null)" ]
 }

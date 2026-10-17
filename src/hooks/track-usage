@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# PostToolUse on Bash|Read: record what happened AFTER a block.
+# PostToolUse on Bash, Read and graff's MCP tools: record what happened AFTER a
+# block.
 #
 # Runs on every Bash and Read call, so the hot path is doing nothing. Triage is
 # therefore a `case` over the raw stdin text: jq is only paid for when the event
@@ -10,9 +11,12 @@
 
 input=$(cat)
 
-# Cheap triage. None of these needles present => nothing to record.
+# Cheap triage. None of these needles present => nothing to record. graff's
+# needles name its questions, not graff alone, which every path in its own
+# repository would hold.
 case "$input" in
-  *graphify*|*bulk-read*|*code-write*|*offset*|*limit*) ;;
+  *mcp__plugin_graff_graff__*|*graff\ def*|*graff\ callers*|*graff\ callees*|*graff\ outline*|*graff\ impact*|*graff\ search*|*graff\ map*|*graff\ why*|*graff\ touched*) ;;
+  *bulk-read*|*code-write*|*offset*|*limit*) ;;
   *) exit 0 ;;
 esac
 
@@ -22,10 +26,13 @@ sid=$(printf '%s' "$input" | jq -r '.session_id // "?"' 2>/dev/null)
 tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null)
 
 case "$tool" in
+  mcp__plugin_graff_graff__*)
+    # A question to graff's map: the funnel's graph event.
+    ctx_log graph "$sid" tool "${tool#mcp__plugin_graff_graff__}" ;;
   Bash)
     cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
     case "$cmd" in
-      *graphify\ query*|*graphify\ explain*|*graphify\ path*)
+      *graff\ def*|*graff\ callers*|*graff\ callees*|*graff\ outline*|*graff\ impact*|*graff\ search*|*graff\ map*|*graff\ why*|*graff\ touched*)
         ctx_log graph "$sid" cmd "${cmd:0:200}" ;;
       *bulk-read*)
         # bulk-read's --paths is what ties this line to the block.

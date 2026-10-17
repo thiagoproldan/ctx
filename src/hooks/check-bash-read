@@ -539,17 +539,6 @@ def log_block(sid, path, lines):
         pass  # a lost measurement, never a stuck session
 
 
-def graphify_hint(path):
-    lib = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "graphify.sh")
-    try:
-        return subprocess.run(
-            ["bash", "-c", '. "$1"; graphify_hint "$2"', "_", lib, path],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.rstrip("\n")
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
 def graff_outline(path):
     """lib/graff.sh's outline of the file, or "" where graff does not read it."""
     lib = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "graff.sh")
@@ -599,9 +588,9 @@ def main():
 
     listing = "\n".join(f"  {p} ({n} lines)" for p, n in biggest)
     paths = " ".join(p for p, _ in biggest)
-    # graff's outline of the biggest file where graff reads it; graphify's hint
+    # graff's outline of the biggest file where graff reads it; nothing more
     # where it does not.
-    hint = (graff_outline(top) or graphify_hint(top)) if top else ""
+    hint = graff_outline(top) if top else ""
     reason = (
         f"This command would put ~{total} lines into your context (threshold: {min_lines}), "
         f"counted across the whole command line — loops, `cd` and multiple files included.\n"

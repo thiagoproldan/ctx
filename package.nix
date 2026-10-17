@@ -19,8 +19,8 @@
 }:
 let
   # Everything the scripts call. Appended to PATH (--suffix), not prepended: the
-  # test suite builds a PATH without graphify to prove the hint stays quiet, and
-  # graphify is deliberately NOT a dependency — it is optional, found on the
+  # test suite builds a PATH without graff to prove the outline stays quiet, and
+  # graff is deliberately NOT a dependency — it is optional, found on the
   # user's PATH when present.
   runtimePath = lib.makeBinPath [
     antigravity-cli
@@ -40,7 +40,7 @@ let
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "ctx";
-  version = "0.14.0";
+  version = "0.15.0";
 
   src = ./src;
 
