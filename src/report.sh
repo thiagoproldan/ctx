@@ -140,9 +140,28 @@ fi
 
 echo
 echo "== 3. sessions: where the context came from"
-# Every Claude Code profile (see usr.claude-code): ~/.claude, ~/.claude-*.
-mapfile -t transcripts < <(find "$HOME"/.claude "$HOME"/.claude-* -path '*/projects/*' -name '*.jsonl' \
-  -newermt "$since" 2>/dev/null)
+# Every Claude Code profile, each once. CLAUDE_CONFIG_DIR takes any path, so a
+# folder counts by what it holds, not by its name (ekko task 75): one level
+# under the home or ~/.config, a folder with the .claude.json Claude Code
+# writes at its first start, or with a login; ~/.claude, Claude Code's default,
+# whose .claude.json sits beside it; and the running session's CLAUDE_CONFIG_DIR.
+claude_profiles() {
+  local dir
+  {
+    [ -n "${CLAUDE_CONFIG_DIR:-}" ] && printf '%s\n' "$CLAUDE_CONFIG_DIR"
+    printf '%s\n' "$HOME/.claude"
+    for dir in "$HOME"/*/ "$HOME"/.*/ "${XDG_CONFIG_HOME:-$HOME/.config}"/*/ "${XDG_CONFIG_HOME:-$HOME/.config}"/.*/; do
+      case "$dir" in */./ | */../) continue ;; esac
+      if [ -f "$dir.claude.json" ] || [ -f "$dir.credentials.json" ]; then printf '%s\n' "${dir%/}"; fi
+    done
+  } | while IFS= read -r dir; do [ -d "$dir" ] && realpath -e -- "$dir"; done | sort -u
+}
+# Each profile's projects/ alone: a profile can itself sit under a folder
+# called projects, as /projects/x does, and its history.jsonl is no transcript.
+mapfile -t profiles < <(claude_profiles)
+roots=()
+for dir in "${profiles[@]}"; do [ -d "$dir/projects" ] && roots+=("$dir/projects"); done
+mapfile -t transcripts < <([ "${#roots[@]}" -gt 0 ] && find "${roots[@]}" -name '*.jsonl' -newermt "$since" 2>/dev/null)
 if [ "${#transcripts[@]}" -eq 0 ]; then
   echo "no transcripts modified since $since"
   exit 0

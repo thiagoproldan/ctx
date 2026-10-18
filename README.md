@@ -438,8 +438,10 @@ names it:
 - an age key (`age-combined-identity.txt`, `sops/age/keys.txt`,
   `$SOPS_AGE_KEY_FILE`), and a private key under `~/.ssh`, told by its first
   line;
-- Claude Code's `~/.claude*/.credentials.json`, gh's `hosts.yml`, git's stored
-  credentials and `~/.netrc`;
+- Claude Code's `.credentials.json`, in `$CLAUDE_CONFIG_DIR` and in any folder
+  one level under the home or `~/.config`, whatever it is called (`~/.nyx` as
+  well as `~/.claude-work`); gh's `hosts.yml`, git's stored credentials and
+  `~/.netrc`;
 - a `.env` or `.env.*` git does not track, bar the templates (`.example`,
   `.sample`, `.template`, `.dist`).
 
@@ -607,9 +609,12 @@ and that session's next block — without that window, one graph query would
 
 ## Is it worth it for how you work?
 
-`ctx-report` section 3 reads the Claude Code transcripts of every profile and
-splits tool output by tool, plus how much of it came in results over the
-threshold — the share a hook could still catch. When this port was rebuilt
+`ctx-report` section 3 reads the Claude Code transcripts of every profile, each
+once, found by what it holds rather than its name: `~/.claude`, a folder one
+level under the home or `~/.config` with a `.claude.json` or a login, and the
+session's own `$CLAUDE_CONFIG_DIR`. It splits tool output by tool, plus how
+much of it came in results over the threshold — the share a hook could still
+catch. When this port was rebuilt
 (2026-09-15), that share was 11% over the previous week: most context came from many small Bash
 outputs, not from big files. The article's 90% was measured on reading big files
 in a monorepo; it is a ceiling for that workload, not a promise for every one.

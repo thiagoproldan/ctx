@@ -348,6 +348,32 @@ has "same-file retry shares the delegation" present "bulk-read         : 2" "$re
 has "a different file still closes the window" present "NOTHING (ignored) : 2" "$rep"
 has "the ignored ones are named" present "1x  /p/c.rs" "$rep"
 
+# Section 3 reads every profile once, found by what it holds rather than its
+# name (ekko task 75): ~/.claude, a folder with a .claude.json or a login one
+# level under the home or ~/.config, and the session's own CLAUDE_CONFIG_DIR;
+# not a folder that only has a projects/ of its own.
+RH="$TMP/report-home"
+transcript() { # <profile folder> <tool name, also the session's id>
+  mkdir -p "$1/projects/p" && printf '%s\n' \
+    "{\"timestamp\":\"2000-01-01T00:00:01Z\",\"sessionId\":\"$2\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"u-$2\",\"name\":\"$2\"}]}}" \
+    "{\"timestamp\":\"2000-01-01T00:00:02Z\",\"sessionId\":\"$2\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"u-$2\",\"content\":\"x\"}]}}" \
+    >"$1/projects/p/$2.jsonl"
+}
+transcript "$RH/.claude" DefaultTool
+transcript "$RH/.nyx" NyxTool && echo '{}' >"$RH/.nyx/.claude.json"
+transcript "$RH/.config/claude" XdgTool && echo '{}' >"$RH/.config/claude/.credentials.json"
+transcript "$RH/.otherapp" OtherTool
+transcript "$TMP/report-elsewhere" SessionTool
+section3() { # <CLAUDE_CONFIG_DIR>
+  env -u XDG_CONFIG_HOME HOME="$RH" CLAUDE_CONFIG_DIR="$1" CTX_FUNNEL="$RFUN" CTX_LEDGER="$TMP/no-ledger.jsonl" \
+    "$ROOT/report.sh" --since 2000-01-01 --until 2000-01-02 2>&1 | sed -n '/^== 3/,$p'
+}
+rep=$(section3 "$TMP/report-elsewhere")
+for t in DefaultTool NyxTool XdgTool SessionTool; do has "section 3 reads $t's profile" present "  $t " "$rep"; done
+has "  not a folder that is no profile" absent "OtherTool" "$rep"
+has "  each once" present "4 sessions, 4 tool results" "$rep"
+has "the session's profile, also found in the home: once" present "3 sessions, 3 tool results" "$(section3 "$RH/.nyx")"
+
 # --- status line ------------------------------------------------------------------
 # It runs after every assistant message and on a timer. Each warning has to
 # appear exactly at its threshold, and a payload it cannot read must leave the
@@ -1785,6 +1811,14 @@ echo 'const x = 1' >"$SEC/repo/src/app.ts"
 GD="$SEC/repo" g add -A && GD="$SEC/repo" g commit -q -m first
 echo 'API_KEY=fake' >"$SEC/repo/.env" && echo 'API_KEY=' >"$SEC/repo/.env.example"
 echo 'AGE-SECRET-KEY-1FAKE' >"$SEC/repo/keys/age-combined-identity.txt"
+# A profile is not told by its name (ekko task 75): CLAUDE_CONFIG_DIR takes any
+# path. One profile in each place the guard looks, a login in a folder that is
+# no profile, and a profile outside them all.
+mkdir -p "$SH/.nyx" "$SH/claude-work" "$SH/.config/claude" "$SH/.otherapp" "$SEC/elsewhere"
+for p in "$SH/.nyx" "$SH/claude-work" "$SH/.config/claude" "$SEC/elsewhere"; do
+  echo '{"claudeAiOauth":{}}' >"$p/.credentials.json" && echo '{}' >"$p/.claude.json"
+done
+echo '{}' >"$SH/.nyx/settings.json" && echo '{"token":"fake"}' >"$SH/.otherapp/.credentials.json"
 
 sec_read() { jq -nc --arg p "$1" --arg d "$SEC/repo" '{tool_name:"Read",tool_input:{file_path:$p},cwd:$d,session_id:"suite"}'; }
 sec_grep() {
@@ -1809,6 +1843,24 @@ sg "Read a tracked .env.development" allow "$(sec_read "$SEC/repo/.env.developme
 sg "Read an untracked .env.example" allow "$(sec_read "$SEC/repo/.env.example")"
 sg "Read a .env.local outside any repository" deny "$(sec_read "$SEC/plain/.env.local")"
 sg "Read a source file" allow "$(sec_read "$SEC/repo/src/app.ts")"
+
+# Claude Code's token wherever its profile is (ekko task 75), named as such; a
+# profile outside the places the guard looks is known to its own sessions only.
+sg "Read the token of a profile named ~/.nyx" deny "$(sec_read "$SH/.nyx/.credentials.json")"
+sg "Read the token of ~/claude-work, not hidden" deny "$(sec_read "$SH/claude-work/.credentials.json")"
+sg "Read the token of a profile under ~/.config" deny "$(sec_read "$SH/.config/claude/.credentials.json")"
+sg "Read a login in a folder that is no profile" deny "$(sec_read "$SH/.otherapp/.credentials.json")"
+sg "Read ~/.nyx's settings.json" allow "$(sec_read "$SH/.nyx/settings.json")"
+sg "Read the token of a profile outside them" allow "$(sec_read "$SEC/elsewhere/.credentials.json")"
+CLAUDE_CONFIG_DIR="$SEC/elsewhere" sg "  the same, from a session of that profile" deny \
+  "$(sec_read "$SEC/elsewhere/.credentials.json")"
+sec_why() {
+  sec_read "$1" | HOME="$SH" CTX_SECRET_ROOTS="$SEC/persist" "$HOOKS/guard-secrets" |
+    jq -r '.hookSpecificOutput.permissionDecisionReason // ""'
+}
+has "~/.nyx's token is named Claude Code's" present "it is Claude Code's login token" "$(sec_why "$SH/.nyx/.credentials.json")"
+has "  ~/.claude-x's too" present "it is Claude Code's login token" "$(sec_why "$SH/.claude-x/.credentials.json")"
+has "  ~/.otherapp's login is not" present "it is a login token" "$(sec_why "$SH/.otherapp/.credentials.json")"
 
 sg "Grep content over a folder holding a .env" deny "$(sec_grep "$SEC/repo" content)"
 sg "Grep files_with_matches over it" allow "$(sec_grep "$SEC/repo" files_with_matches)"
@@ -1837,6 +1889,9 @@ sb "grep for the words /persist/secrets" allow "grep -rn $SEC/persist src"
 sb "sed -n 1p .env" deny 'sed -n 1p .env'
 sb "sed -i on .env" allow "sed -i 's/1/2/' .env"
 sb "jq on .credentials.json" deny 'jq . ~/.claude-x/.credentials.json'
+sb "cat ~/.nyx's token" deny 'cat ~/.nyx/.credentials.json'
+sb "grep -r over ~/.nyx, matching its token" deny 'grep -r claude ~/.nyx'
+sb "grep -r over ~/.nyx, matching nothing in it" allow 'grep -r absent-word ~/.nyx'
 sb "jq's .env filter on settings.json" allow "jq '.env.X' ~/.claude-x/settings.json"
 sb "cat < ~/.netrc" deny 'cat < ~/.netrc'
 sb "cat .env | wc -l: a pipe counts as shown" deny 'cat .env | wc -l'

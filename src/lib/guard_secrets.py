@@ -7,8 +7,9 @@ secret by where it is and what it holds, not by the command that names it:
   /persist/secrets, /run/secrets and /run/secrets.d by default);
 - an age key: age-combined-identity.txt, sops/age/keys.txt, $SOPS_AGE_KEY_FILE;
 - a private key under ~/.ssh, told by its first line;
-- Claude Code's ~/.claude*/.credentials.json, gh's hosts.yml, git's stored
-  credentials and ~/.netrc;
+- Claude Code's .credentials.json, in $CLAUDE_CONFIG_DIR and in any folder
+  one level under the home or ~/.config, whatever it is called; gh's
+  hosts.yml, git's stored credentials and ~/.netrc;
 - a .env or .env.* file git does not track, bar the templates (.env.example,
   .sample, .template, .dist).
 
@@ -29,6 +30,7 @@ because its output went elsewhere, goes to $CTX_STATE/guard.jsonl.
 """
 
 import fnmatch
+import functools
 import glob
 import json
 import os
@@ -97,8 +99,11 @@ def config_home():
     return os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
 
 
+@functools.cache
 def credential_files():
-    """The fixed files that hold a login, and what each holds."""
+    """The fixed files that hold a login, and what each holds. Once per call
+    of the guard: claude_tokens() globs four folders, and a search is checked
+    against every fixed secret."""
     gh = os.environ.get("GH_CONFIG_DIR") or os.path.join(config_home(), "gh")
     files = {
         os.path.join(gh, "hosts.yml"): "gh's GitHub token",
@@ -109,9 +114,33 @@ def credential_files():
     }
     if os.environ.get("SOPS_AGE_KEY_FILE"):
         files[os.environ["SOPS_AGE_KEY_FILE"]] = "an age key"
-    for path in glob.glob(os.path.join(HOME, ".claude*", ".credentials.json")):
-        files[path] = "Claude Code's login token"
+    for path in claude_tokens():
+        files[path] = "Claude Code's login token" if claude_profile(os.path.dirname(path)) else "a login token"
     return {os.path.realpath(path): what for path, what in files.items()}
+
+
+def claude_tokens():
+    """Where Claude Code keeps a login: the .credentials.json of the running
+    session's CLAUDE_CONFIG_DIR, and of every folder one level under the home
+    or ~/.config. CLAUDE_CONFIG_DIR takes any path, so a profile is not told
+    by its name: ~/.nyx holds one as ~/.claude-x does (ekko task 75)."""
+    paths = []
+    for top in (HOME, config_home()):
+        for pattern in ("*", ".*"):
+            paths += glob.glob(os.path.join(top, pattern, ".credentials.json"))
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        paths.append(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".credentials.json"))
+    return paths
+
+
+def claude_profile(folder):
+    """Whether folder is a Claude Code profile: the running session's, one
+    named .claude*, or one holding the .claude.json Claude Code writes at its
+    first start."""
+    session = os.environ.get("CLAUDE_CONFIG_DIR")
+    if session and os.path.realpath(folder) == os.path.realpath(session):
+        return True
+    return os.path.basename(folder).startswith(".claude") or os.path.isfile(os.path.join(folder, ".claude.json"))
 
 
 def private_key(path):
